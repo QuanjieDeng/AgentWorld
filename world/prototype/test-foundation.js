@@ -14,7 +14,7 @@ import {
   kill,
   MS_PER_TICK,
 } from './engine.js';
-import { advanceOffline } from './persistence.js';
+import { advanceOffline, rebuildWorld } from './persistence.js';
 import { processBrains } from './brain.js';
 
 function observable(w) {
@@ -79,11 +79,7 @@ test('世界可以存档并原样加载，继续跑也和没中断一样', () =>
 
 test('记录下来的决策可以重放出同样的世界', () => {
   const cut = 300;
-  const world = createWorld(7);
-  for (let i = 0; i < cut; i++) {
-    tick(world);
-    processBrains(world);
-  }
+  const world = runWorld(7, cut);
   const saved = serializeWorld(world);
   const decisionsAtCut = world.decisionLog.length;
 
@@ -122,6 +118,8 @@ test('离线推进按真实时间换算 tick，只汇总关键事件，并遵守
   assert.ok(result.keyEvents.some((e) => e.type === 'death' && e.agentId === victim.id));
   assert.ok(!result.keyEvents.some((e) => e.type === 'talk'));
   assert.ok(result.keyEvents.every((e) => e.seq > startSeq));
+  assert.ok(result.gone.includes(victim.id));
+  assert.ok(!result.stillAlive.includes(victim.id));
 
   const capped = createWorld(7);
   const cappedResult = advanceOffline(capped, MS_PER_TICK * 500, { maxTicks: 20 });
@@ -157,17 +155,50 @@ test('死亡同时写入事实层和目击者的信念，两者分开保存并�
   );
 });
 
-test('存档不包含 API Key', () => {
+test('存档不包含 API Key 与模型配置', () => {
   const world = createWorld(7);
   world.api.key = 'sk-test-secret';
   world.api.base = 'http://example.invalid';
   world.api.model = 'test-model';
+  world.config.llmAgents = 3;
+  world.agents[0].useLLM = true;
 
   const saved = serializeWorld(world);
   assert.ok(!JSON.stringify(saved).includes('sk-test-secret'));
+  assert.ok(!JSON.stringify(saved).includes('http://example.invalid'));
+  assert.ok(!JSON.stringify(saved).includes('test-model'));
 
   const loaded = loadWorld(saved);
   assert.equal(loaded.api.key, '');
-  assert.equal(loaded.api.base, 'http://example.invalid');
-  assert.equal(loaded.api.model, 'test-model');
+  assert.equal(loaded.api.base, '');
+  assert.equal(loaded.api.model, '');
+  assert.ok(loaded.agents.every((a) => !a.useLLM));
+});
+
+test('决策作为带序号的事件写进事件日志，并可据此重建世界', () => {
+  const world = runWorld(7, 300);
+  const decisions = world.eventLog.filter((e) => e.type === 'decision');
+
+  assert.ok(decisions.length > 0);
+  assert.ok(
+    decisions.every(
+      (e) => e.seq > 0 && e.payload && e.payload.action && typeof e.payload.rngAfter === 'number'
+    )
+  );
+  for (let i = 1; i < world.eventLog.length; i++) {
+    assert.equal(world.eventLog[i].seq, world.eventLog[i - 1].seq + 1);
+  }
+
+  const rebuilt = rebuildWorld({ seed: 7, decisions: world.decisionLog, tick: world.tick });
+  assert.deepEqual(serializeWorld(rebuilt), serializeWorld(world));
+});
+
+test('存档归一化进行中的决策，往返完全一致', () => {
+  const world = createWorld(7);
+  world.agents[0].deciding = true;
+  const saved = serializeWorld(world);
+  assert.equal(saved.agents[0].deciding, false);
+
+  const loaded = loadWorld(saved);
+  assert.deepEqual(serializeWorld(loaded), saved);
 });

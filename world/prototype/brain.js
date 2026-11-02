@@ -1,7 +1,7 @@
 // brain.js — 两种大脑：规则驱动（默认）与 LLM 驱动（玩家自带 key）。
 // 两者都只能提交"意图"，引擎负责判定。
 
-import { TILE, W, H, DIRS, resourceNear, isWalkable } from './engine.js';
+import { TILE, W, H, DIRS, resourceNear, isWalkable, logDecision } from './engine.js';
 import { visibleAgents, visibleStructures, visibleWolves, heardSounds } from './perception.js';
 
 const DIR_NAMES = { N: '北', S: '南', W: '西', E: '东' };
@@ -436,11 +436,10 @@ async function llmDecide(world, a) {
 // ---------- 调度 ----------
 
 function recordDecision(world, a, action, source) {
-  world.decisionLog.push({
-    tick: world.tick,
+  logDecision(world, {
     agentId: a.id,
     source,
-    action: { ...action },
+    action,
     rngAfter: world.rng.getState(),
   });
 }
@@ -455,7 +454,12 @@ function applyReplayDecisions(world) {
     a.deciding = false;
     a.cooldownUntil = Math.max(a.cooldownUntil || 0, world.tick + 2);
     if (typeof d.rngAfter === 'number') world.rng.setState(d.rngAfter);
-    world.decisionLog.push({ ...d, action: { ...d.action } });
+    logDecision(world, {
+      agentId: d.agentId,
+      source: d.source,
+      action: d.action,
+      rngAfter: d.rngAfter,
+    });
   }
   world.pendingDecisions = [];
 }
@@ -476,7 +480,7 @@ export function processBrains(world) {
       continue;
     }
 
-    if (world.api.key && a.useLLM && !world.forceRule && world.inflight < 6) {
+    if (world.api.key && a.useLLM && !world.ruleOnly && world.inflight < 6) {
       world.inflight++;
       world.llmCalls = (world.llmCalls || 0) + 1;
       llmDecide(world, a)

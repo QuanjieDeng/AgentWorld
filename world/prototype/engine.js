@@ -183,8 +183,16 @@ export function createWorld(seed = 20261102) {
   return world;
 }
 
-export function logEvent(world, type, text, agentId = null) {
-  const entry = {
+function appendEvent(world, entry, { ui = true } = {}) {
+  world.eventLog.push(entry);
+  if (!ui) return entry;
+  world.log.push(entry);
+  if (world.log.length > 400) world.log.shift();
+  return entry;
+}
+
+export function logEvent(world, type, text, agentId = null, payload = null) {
+  return appendEvent(world, {
     seq: world.nextSeq++,
     t: world.tick,
     day: world.day || 1,
@@ -192,10 +200,34 @@ export function logEvent(world, type, text, agentId = null) {
     type,
     text,
     agentId,
+    payload,
+  });
+}
+
+export function logDecision(world, { agentId, source, action, rngAfter }) {
+  const event = appendEvent(
+    world,
+    {
+      seq: world.nextSeq++,
+      t: world.tick,
+      day: world.day || 1,
+      clock: world.clock || '08:00',
+      type: 'decision',
+      text: '',
+      agentId,
+      payload: { source, action: { ...action }, rngAfter },
+    },
+    { ui: false }
+  );
+  const entry = {
+    seq: event.seq,
+    tick: world.tick,
+    agentId,
+    source,
+    action: { ...action },
+    rngAfter,
   };
-  world.eventLog.push(entry);
-  world.log.push(entry);
-  if (world.log.length > 400) world.log.shift();
+  world.decisionLog.push(entry);
   return entry;
 }
 
@@ -229,14 +261,6 @@ export function recordBelief(world, agent, proposition, source, confidence = 0.8
 }
 
 export function isWalkable(world, x, y) {
-  if (x < 0 || y < 0 || x >= W || y >= H) return false;
-  const t = world.map[y * W + x];
-  if (t === TILE.WATER || t === TILE.TREE || t === TILE.ROCK) return false;
-  if (world.structures.some((s) => s.type === 'wall' && s.x === x && s.y === y)) return false;
-  return true;
-}
-
-export function isWolfWalkable(world, x, y) {
   if (x < 0 || y < 0 || x >= W || y >= H) return false;
   const t = world.map[y * W + x];
   if (t === TILE.WATER || t === TILE.TREE || t === TILE.ROCK) return false;
@@ -497,7 +521,14 @@ function runAction(world, a) {
         a.inventory.wood -= 2;
         a.inventory.weapon = 1;
         remember(a, `你${act.reason ? `因为${act.reason}，` : ''}把木头削成了一件武器。`);
-        logEvent(world, 'craft', `${a.name}${why}造出了一件粗糙的武器。`, a.id);
+        const crafted = logEvent(world, 'craft', `${a.name}${why}造出了一件粗糙的武器。`, a.id);
+        recordFact(world, {
+          type: 'craft',
+          subjectId: a.id,
+          predicate: 'crafted',
+          object: 'weapon',
+          eventSeq: crafted.seq,
+        });
       }
       break;
     }
@@ -517,7 +548,16 @@ function runAction(world, a) {
           !world.structures.some((o) => o.type === 'camp' && Math.abs(o.x - a.x) + Math.abs(o.y - a.y) <= 3);
         if (madeCamp) world.structures.push({ type: 'camp', x: a.x, y: a.y });
         const names = { fire: '火堆', shelter: '窝棚', wall: '墙' };
-        logEvent(world, 'build', `${a.name}${why}建起了一个${names[act.build] || act.build}。`, a.id);
+        const built = logEvent(world, 'build', `${a.name}${why}建起了一个${names[act.build] || act.build}。`, a.id);
+        recordFact(world, {
+          type: 'build',
+          subjectId: a.id,
+          predicate: 'built',
+          object: act.build,
+          x: a.x,
+          y: a.y,
+          eventSeq: built.seq,
+        });
         if (madeCamp) logEvent(world, 'build', '这里成了一个营地。', a.id);
         remember(a, `你${act.reason ? `因为${act.reason}，` : ''}建起了一个${names[act.build] || act.build}。`);
         emitSound(world, a.x, a.y, 6, 'work', '有人在敲打东西', a.id);
@@ -562,12 +602,28 @@ function runAction(world, a) {
         if (wolf) {
           faceToward(a, wolf.x, wolf.y);
           wolf.hp -= 10 + a.skills.fight * 2 + a.inventory.weapon * 5;
-          logEvent(world, 'fight', `${a.name}${why}打伤了那头野兽。`, a.id);
+          const struck = logEvent(world, 'fight', `${a.name}${why}打伤了那头野兽。`, a.id);
+          recordFact(world, {
+            type: 'fight',
+            subjectId: a.id,
+            predicate: 'struck',
+            object: 'wolf',
+            targetId: wolf.id,
+            eventSeq: struck.seq,
+          });
           emitSound(world, a.x, a.y, 12, 'fight', '有人在和野兽搏斗', a.id);
           if (wolf.hp <= 0) {
             world.wolves = world.wolves.filter((w) => w !== wolf);
             a.reputation += 5;
-            logEvent(world, 'fight', `${a.name}${why}杀死了一头野兽。`, a.id);
+            const slain = logEvent(world, 'fight', `${a.name}${why}杀死了一头野兽。`, a.id);
+            recordFact(world, {
+              type: 'fight',
+              subjectId: a.id,
+              predicate: 'killed',
+              object: 'wolf',
+              targetId: wolf.id,
+              eventSeq: slain.seq,
+            });
             remember(a, '你杀死了一头野兽。');
           }
         }
@@ -583,7 +639,15 @@ function runAction(world, a) {
         damage(world, target, dmg, a);
         a.reputation -= 2;
         target.relationships[a.id] = (target.relationships[a.id] || 0) - 25;
-        logEvent(world, 'fight', `${a.name}${why}攻击了${target.name}。`, a.id);
+        const attacked = logEvent(world, 'fight', `${a.name}${why}攻击了${target.name}。`, a.id);
+        recordFact(world, {
+          type: 'fight',
+          subjectId: a.id,
+          predicate: 'attacked',
+          object: target.id,
+          damage: dmg,
+          eventSeq: attacked.seq,
+        });
         emitSound(world, a.x, a.y, 14, 'fight', '有人在打斗', a.id);
         remember(a, `你攻击了${target.name}。${act.reason ? `因为：${act.reason}` : ''}`);
         remember(target, `${a.name}攻击了你。${act.reason ? `他说：${act.reason}` : ''}`);
@@ -643,7 +707,7 @@ function spawnWolves(world) {
       if (edge === 1) y = H - 3;
       if (edge === 2) x = 2;
       if (edge === 3) x = W - 3;
-      if (isWolfWalkable(world, x, y)) {
+      if (isWalkable(world, x, y)) {
         world.wolves.push({ id: 'w' + world.nextWolfId++, x, y, hp: 30, cooldown: 0 });
         emitSound(world, x, y, 22, 'howl', '远处传来野兽的嚎叫');
         break;
@@ -683,7 +747,7 @@ function updateWolves(world) {
       let ny = w.y;
       if (Math.abs(best.x - w.x) > Math.abs(best.y - w.y)) nx += dx;
       else ny += dy;
-      if (isWolfWalkable(world, nx, ny) && !nearFire(world, nx, ny, 2)) {
+      if (isWalkable(world, nx, ny) && !nearFire(world, nx, ny, 2)) {
         w.x = nx;
         w.y = ny;
       }
@@ -750,6 +814,34 @@ export function tick(world) {
 }
 
 // ---------- 存档与加载 ----------
+// 存档只包含世界与事件；密钥、模型配置、进行中的模型调用都不入档。
+
+function copyEvent(e) {
+  return {
+    ...e,
+    payload: e.payload
+      ? { ...e.payload, action: e.payload.action ? { ...e.payload.action } : e.payload.action }
+      : null,
+  };
+}
+
+function copyAgentForStorage(a, deciding) {
+  return {
+    ...a,
+    inventory: { ...a.inventory },
+    tags: { ...a.tags },
+    skills: { ...a.skills },
+    relationships: { ...a.relationships },
+    memory: [...a.memory],
+    beliefs: (a.beliefs || []).map((b) => ({ ...b })),
+    trace: a.trace.map((t) => ({ ...t })),
+    action: a.action ? { ...a.action } : null,
+    queuedAction: a.queuedAction ? { ...a.queuedAction } : null,
+    // 进行中的模型调用不会跨进程存活；存档时统一归一化。
+    deciding,
+    useLLM: false,
+  };
+}
 
 export function serializeWorld(world) {
   return {
@@ -761,38 +853,22 @@ export function serializeWorld(world) {
     isNight: world.isNight,
     nightActive: world.nightActive,
     map: Array.from(world.map),
-    agents: world.agents.map((a) => ({
-      ...a,
-      inventory: { ...a.inventory },
-      tags: { ...a.tags },
-      skills: { ...a.skills },
-      relationships: { ...a.relationships },
-      memory: [...a.memory],
-      beliefs: a.beliefs.map((b) => ({ ...b })),
-      trace: a.trace.map((t) => ({ ...t })),
-      action: a.action ? { ...a.action } : null,
-      queuedAction: a.queuedAction ? { ...a.queuedAction } : null,
-    })),
+    agents: world.agents.map((a) => copyAgentForStorage(a, false)),
     structures: world.structures.map((s) => ({ ...s })),
     wolves: world.wolves.map((w) => ({ ...w })),
-    log: world.log.map((e) => ({ ...e })),
-    eventLog: world.eventLog.map((e) => ({ ...e })),
+    log: world.log.map(copyEvent),
+    eventLog: world.eventLog.map(copyEvent),
     facts: world.facts.map((f) => ({ ...f })),
     nextSeq: world.nextSeq,
     nextFactId: world.nextFactId,
     nextBeliefId: world.nextBeliefId,
     decisionLog: world.decisionLog.map((d) => ({ ...d, action: { ...d.action } })),
-    replay: null,
     sounds: world.sounds.map((s) => ({ ...s })),
     regrow: world.regrow.map((r) => ({ ...r })),
     nextWolfId: world.nextWolfId,
-    config: { ...world.config },
-    // 存档永远不包含密钥。
-    api: { provider: world.api.provider, base: world.api.base, model: world.api.model },
+    config: { paused: world.config.paused, speed: world.config.speed },
+    api: {},
     rngState: world.rng.getState(),
-    llmCalls: world.llmCalls || 0,
-    llmErrors: world.llmErrors || 0,
-    llmLastError: world.llmLastError || '',
   };
 }
 
@@ -800,7 +876,7 @@ export function loadWorld(data) {
   const rng = mulberry32(0);
   rng.setState(data.rngState);
 
-  const world = {
+  return {
     seed: data.seed,
     tick: data.tick,
     day: data.day,
@@ -808,23 +884,11 @@ export function loadWorld(data) {
     isNight: data.isNight,
     nightActive: data.nightActive,
     map: Uint8Array.from(data.map),
-    agents: data.agents.map((a) => ({
-      ...a,
-      inventory: { ...a.inventory },
-      tags: { ...a.tags },
-      skills: { ...a.skills },
-      relationships: { ...a.relationships },
-      memory: [...a.memory],
-      beliefs: (a.beliefs || []).map((b) => ({ ...b })),
-      trace: a.trace.map((t) => ({ ...t })),
-      action: a.action ? { ...a.action } : null,
-      queuedAction: a.queuedAction ? { ...a.queuedAction } : null,
-      deciding: false,
-    })),
+    agents: data.agents.map((a) => copyAgentForStorage(a, false)),
     structures: data.structures.map((s) => ({ ...s })),
     wolves: data.wolves.map((w) => ({ ...w })),
-    log: data.log.map((e) => ({ ...e })),
-    eventLog: data.eventLog.map((e) => ({ ...e })),
+    log: data.log.map(copyEvent),
+    eventLog: data.eventLog.map(copyEvent),
     facts: (data.facts || []).map((f) => ({ ...f })),
     nextSeq: data.nextSeq,
     nextFactId: data.nextFactId || 1,
@@ -834,17 +898,15 @@ export function loadWorld(data) {
     sounds: data.sounds.map((s) => ({ ...s })),
     regrow: data.regrow.map((r) => ({ ...r })),
     nextWolfId: data.nextWolfId,
-    config: { ...data.config },
-    api: { provider: data.api.provider || 'openai', base: data.api.base || '', key: '', model: data.api.model || '' },
+    config: { paused: false, speed: 1, llmAgents: 0, ...data.config },
+    api: { provider: 'openai', base: '', key: '', model: '' },
     rng,
     pendingDecisions: [],
     inflight: 0,
-    llmCalls: data.llmCalls || 0,
-    llmErrors: data.llmErrors || 0,
-    llmLastError: data.llmLastError || '',
+    llmCalls: 0,
+    llmErrors: 0,
+    llmLastError: '',
   };
-
-  return world;
 }
 
 export function replayDecisions(world, decisions) {

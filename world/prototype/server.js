@@ -5,9 +5,8 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createWorld, tick, snapshot, serializeWorld, loadWorld } from './engine.js';
-import { processBrains } from './brain.js';
-import { advanceOffline } from './persistence.js';
+import { createWorld, snapshot, serializeWorld, loadWorld, logEvent, remember, MS_PER_TICK } from './engine.js';
+import { advanceOffline, stepWorld } from './persistence.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -32,18 +31,28 @@ function loadOrCreate() {
 const world = loadOrCreate();
 const clients = new Set();
 
-if (process.env.LLM_BASE) {
-  world.api.base = process.env.LLM_BASE;
-  world.api.key = process.env.LLM_KEY || '';
-  world.api.model = process.env.LLM_MODEL || '';
-  world.api.provider = process.env.LLM_PROVIDER === 'anthropic' ? 'anthropic' : 'openai';
-  const raw = process.env.LLM_AGENTS ? Number(process.env.LLM_AGENTS) : world.agents.length;
+function applyApiConfig(source) {
+  world.api.provider = source.provider === 'anthropic' ? 'anthropic' : 'openai';
+  world.api.base = String(source.base || '').trim();
+  world.api.key = String(source.key || '').trim();
+  world.api.model = String(source.model || '').trim();
+  const raw = source.llmAgents === undefined ? world.agents.length : Number(source.llmAgents);
   const count = Math.max(0, Math.min(world.agents.length, Number.isFinite(raw) ? raw : world.agents.length));
   world.config.llmAgents = count;
   world.agents.forEach((a, i) => {
     a.useLLM = !!world.api.key && i < count;
   });
-  console.log(`  LLM: ${world.api.provider} · ${world.api.model} · ${count} 人`);
+}
+
+if (process.env.LLM_BASE) {
+  applyApiConfig({
+    provider: process.env.LLM_PROVIDER,
+    base: process.env.LLM_BASE,
+    key: process.env.LLM_KEY,
+    model: process.env.LLM_MODEL,
+    llmAgents: process.env.LLM_AGENTS,
+  });
+  console.log(`  LLM: ${world.api.provider} · ${world.api.model} · ${world.config.llmAgents} 人`);
 }
 
 const MIME = {
@@ -95,30 +104,14 @@ async function handleApi(req, res, url) {
     const text = String(body.text || '').slice(0, 160).trim();
     if (!text) return json(res, { ok: false, error: 'empty' }, 400);
     a.letter = text;
-    a.memory.push(`你听见一个声音说：「${text}」`);
-    if (a.memory.length > 20) a.memory.shift();
-    world.log.push({
-      t: world.tick,
-      day: world.day,
-      clock: world.clock,
-      type: 'letter',
-      text: `一个声音在${a.name}耳边说：「${text}」`,
-      agentId: a.id,
-    });
+    remember(a, `你听见一个声音说：「${text}」`);
+    logEvent(world, 'letter', `一个声音在${a.name}耳边说：「${text}」`, a.id, { text });
     return json(res, { ok: true });
   }
 
   if (url.pathname === '/api/config') {
-    world.api.provider = body.provider === 'anthropic' ? 'anthropic' : 'openai';
-    world.api.base = String(body.base || '').trim();
-    world.api.key = String(body.key || '').trim();
-    world.api.model = String(body.model || '').trim();
-    const n = Math.max(0, Math.min(world.agents.length, Number(body.llmAgents) || 0));
-    world.config.llmAgents = n;
-    world.agents.forEach((a, i) => {
-      a.useLLM = !!world.api.key && i < n;
-    });
-    return json(res, { ok: true, configured: !!world.api.key, llmAgents: n });
+    applyApiConfig(body);
+    return json(res, { ok: true, configured: !!world.api.key, llmAgents: world.config.llmAgents });
   }
 
   if (url.pathname === '/api/state') {
@@ -182,16 +175,25 @@ function broadcast() {
   }
 }
 
+// 24 倍：1 现实小时 = 1 世界日。按真实经过时间累积 tick，和离线推进同一把尺子。
+let lastTickAt = Date.now();
+let tickCarry = 0;
 setInterval(() => {
+  const now = Date.now();
+  const elapsed = now - lastTickAt;
+  lastTickAt = now;
   if (!world.config.paused) {
     const speed = Math.max(1, world.config.speed | 0);
-    for (let i = 0; i < speed; i++) {
-      tick(world);
-      processBrains(world);
+    tickCarry += elapsed * speed;
+    while (tickCarry >= MS_PER_TICK) {
+      stepWorld(world, 1);
+      tickCarry -= MS_PER_TICK;
     }
+  } else {
+    tickCarry = 0;
   }
   broadcast();
-}, 1000);
+}, 250);
 
 function saveWorld() {
   try {
