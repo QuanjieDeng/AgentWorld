@@ -1,0 +1,11 @@
+{
+  "name": "last-island-prototype",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test test-foundation.js",
+    "test:sim": "node test-sim.js",
+    "test:cycles": "node test-cycles.js"
+  }
+}

@@ -1,0 +1,74 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>最后的岛 · 垂直切片</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <div id="app">
+    <main id="stage">
+      <header>
+        <div class="brand">
+          <h1>最后的岛</h1>
+          <p>垂直切片 · 十二个人在废墟上醒来</p>
+        </div>
+        <div class="status">
+          <span id="clock">第 1 天 · 08:00</span>
+          <span id="pop">活着 12 / 12</span>
+        </div>
+        <div class="controls">
+          <button id="pauseBtn">暂停</button>
+          <button class="speed active" data-speed="1">1×</button>
+          <button class="speed" data-speed="2">2×</button>
+          <button class="speed" data-speed="4">4×</button>
+          <button class="speed" data-speed="8">8×</button>
+        </div>
+      </header>
+
+      <div class="canvas-wrap">
+        <canvas id="map" width="640" height="640"></canvas>
+        <div id="hint">点击一个人，查看他的一生。</div>
+      </div>
+    </main>
+
+    <aside>
+      <section class="panel" id="selectedPanel">
+        <h2>选中</h2>
+        <div id="agentInfo" class="muted">还没有选中任何人。点地图上的一个人。</div>
+        <form id="whisperForm" autocomplete="off">
+          <input id="whisperInput" maxlength="120" placeholder="以祖先的声音写一封信…" disabled />
+          <button type="submit" disabled>寄出</button>
+        </form>
+      </section>
+
+      <section class="panel">
+        <h2>大脑</h2>
+        <form id="configForm" autocomplete="off">
+          <select name="provider">
+            <option value="openai">OpenAI 兼容</option>
+            <option value="anthropic">Anthropic 兼容</option>
+          </select>
+          <input name="base" placeholder="API 地址，如 https://api.deepseek.com/v1" />
+          <input name="key" type="password" placeholder="API Key（只保存在这个进程里）" />
+          <input name="model" placeholder="模型名，如 deepseek-chat" />
+          <label class="inline">用 LLM 的人数
+            <input name="llmAgents" type="number" min="0" max="12" value="12" />
+          </label>
+          <button type="submit">保存</button>
+        </form>
+        <p class="note">不配置时，十二个人全由规则驱动，世界照常运行。配置后，前 N 个人改用你的模型思考。</p>
+        <p class="note" id="brainStatus"></p>
+      </section>
+
+      <section class="panel grow">
+        <h2>发生了什么</h2>
+        <ul id="log"></ul>
+      </section>
+    </aside>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
