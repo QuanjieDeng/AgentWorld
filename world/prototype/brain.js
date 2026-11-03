@@ -653,7 +653,7 @@ function endpoint(base, provider) {
   return `${b}/chat/completions`;
 }
 
-async function requestLLM(world, sys, user) {
+export async function requestLLM(world, sys, user, maxTokens = 400) {
   const anthropic = world.api.provider === 'anthropic';
   const url = endpoint(world.api.base, world.api.provider);
 
@@ -666,7 +666,7 @@ async function requestLLM(world, sys, user) {
     headers['anthropic-version'] = '2023-06-01';
     body = {
       model: world.api.model,
-      max_tokens: 400,
+      max_tokens: maxTokens,
       temperature: 0.9,
       system: sys,
       messages: [{ role: 'user', content: user }],
@@ -680,7 +680,7 @@ async function requestLLM(world, sys, user) {
         { role: 'user', content: user },
       ],
       temperature: 0.9,
-      max_tokens: 400,
+      max_tokens: maxTokens,
     };
   }
 

@@ -3,7 +3,17 @@
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { createWorld, tick, kill, recordBelief, deliverLetter, TILE, W } from './engine.js';
+import {
+  createWorld,
+  tick,
+  kill,
+  recordBelief,
+  deliverLetter,
+  letterCooldownLeft,
+  LETTER_COOLDOWN_TICKS,
+  TILE,
+  W,
+} from './engine.js';
 import { processBrains } from './brain.js';
 
 function agent(world, name) {
@@ -170,6 +180,22 @@ test('祖先的声音只传给已经在关系链里的人', () => {
   const letters = world.eventLog.filter((e) => e.type === 'letter');
   assert.equal(letters[0].payload.heard, false);
   assert.equal(letters[1].payload.heard, true);
+});
+
+test('被听见的信需要冷却，冷却结束后才能再写', () => {
+  const world = createWorld(7);
+  const a = agent(world, '阿禾');
+  a.mentorId = 'a1';
+
+  assert.equal(deliverLetter(world, a, '第一封。'), true);
+  assert.ok(letterCooldownLeft(world, a) > 0);
+
+  assert.equal(deliverLetter(world, a, '紧接着的第二封。'), false, '冷却中不能再写');
+  assert.equal(a.letter, '第一封。');
+
+  world.tick += LETTER_COOLDOWN_TICKS;
+  assert.equal(deliverLetter(world, a, '很久以后的第三封。'), true);
+  assert.equal(a.letter, '很久以后的第三封。');
 });
 
 test('住在别人家里，休息不会更舒服', () => {

@@ -14,9 +14,14 @@
           <h1>最后的岛</h1>
           <p>垂直切片 · 十二个人在废墟上醒来</p>
         </div>
+        <nav class="modes" id="modes">
+          <button class="mode active" data-mode="follow">跟随</button>
+          <button class="mode" data-mode="island">全岛</button>
+        </nav>
         <div class="status">
           <span id="clock">第 1 天 · 08:00</span>
           <span id="pop">活着 12 / 12</span>
+          <span id="syncStatus" class="sync-status" title="同步状态">单机</span>
         </div>
         <div class="controls">
           <button id="pauseBtn">暂停</button>
@@ -30,21 +35,56 @@
       <div class="canvas-wrap">
         <canvas id="map" width="640" height="640"></canvas>
         <div id="hint">点击一个人，查看他的一生。</div>
+        <div id="followBadge" class="follow-badge" hidden></div>
+      </div>
+
+      <div class="timeline">
+        <div class="tl-head">
+          <span class="tl-title">时间轴</span>
+          <span id="tlNow" class="muted">第 1 天</span>
+        </div>
+        <div id="tlDays" class="tl-days"></div>
       </div>
     </main>
 
     <aside>
+      <section class="panel return" id="returnPanel" hidden>
+        <div class="return-head">
+          <h2>你不在的时候</h2>
+          <button id="dismissReturn">知道了</button>
+        </div>
+        <div id="returnBody" class="muted"></div>
+      </section>
+
       <section class="panel" id="selectedPanel">
-        <h2>选中</h2>
+        <h2>跟随</h2>
         <div id="agentInfo" class="muted">还没有选中任何人。点地图上的一个人。</div>
         <form id="whisperForm" autocomplete="off">
           <input id="whisperInput" maxlength="120" placeholder="以祖先的声音写一封信…" disabled />
           <button type="submit" disabled>寄出</button>
+          <div id="whisperNote" class="note"></div>
         </form>
       </section>
 
-      <section class="panel">
-        <h2>大脑</h2>
+      <section class="panel" id="islandPanel" hidden>
+        <h2>全岛总览</h2>
+        <div id="islandBody" class="muted"></div>
+      </section>
+
+      <section class="panel" id="chroniclePanel">
+        <div class="return-head">
+          <h2>编年史 · 我的版本</h2>
+          <span class="chron-actions">
+            <button id="todayBtn">今天</button>
+            <button id="narrateBtn">生成</button>
+          </span>
+        </div>
+        <div id="chronicleRange" class="muted">第 1 天</div>
+        <div id="chronicleBody" class="muted">选一天，看那天发生了什么。</div>
+      </section>
+
+      <details class="panel" id="brainPanel">
+        <summary>大脑</summary>
         <form id="configForm" autocomplete="off">
           <select name="provider">
             <option value="openai">OpenAI 兼容</option>
@@ -58,9 +98,9 @@
           </label>
           <button type="submit">保存</button>
         </form>
-        <p class="note">不配置时，十二个人全由规则驱动，世界照常运行。配置后，前 N 个人改用你的模型思考。</p>
+        <p class="note">不配置时，十二个人全由规则驱动，世界照常运行。配置后，前 N 个人改用你的模型思考；编年史也会由你的模型来写。</p>
         <p class="note" id="brainStatus"></p>
-      </section>
+      </details>
 
       <section class="panel grow">
         <h2>发生了什么</h2>

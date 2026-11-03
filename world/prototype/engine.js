@@ -418,7 +418,16 @@ export function remember(agent, text) {
   if (agent.memory.length > 20) agent.memory.shift();
 }
 
+// 一封信写出去之后，要等这么久（世界分钟）才能再写。
+export const LETTER_COOLDOWN_TICKS = 240;
+
+export function letterCooldownLeft(world, agent) {
+  return Math.max(0, Math.round((agent.letterCooldownUntil || 0) - world.tick));
+}
+
 export function deliverLetter(world, agent, text) {
+  if (letterCooldownLeft(world, agent) > 0) return false;
+
   const inChain = !!(agent.mentorId || agent.heirId);
   if (!inChain) {
     logEvent(world, 'letter', `${agent.name}听见了一个声音，但没有听懂。`, agent.id, {
@@ -429,6 +438,7 @@ export function deliverLetter(world, agent, text) {
     return false;
   }
   agent.letter = text;
+  agent.letterCooldownUntil = world.tick + LETTER_COOLDOWN_TICKS;
   remember(agent, `你听见一个声音说：「${text}」`);
   rememberAgent(world, agent.id, MENTION_GAIN.letter);
   logEvent(world, 'letter', `一个声音在${agent.name}耳边说：「${text}」`, agent.id, {
@@ -931,6 +941,7 @@ export function applyTurning(world, agent, trigger, label, reason) {
   const event = logEvent(world, 'turning', `${agent.name}脱变成了${chosen}。${reason}`, agent.id, {
     trigger,
     label: chosen,
+    reason,
   });
   recordFact(world, {
     type: 'turning',
@@ -963,6 +974,18 @@ export function applyTurning(world, agent, trigger, label, reason) {
 
 export function maybeTurn(world, agent, trigger, reason) {
   if (!agent || !canTurn(agent, trigger)) return null;
+
+  // 重放时以日志里的脱变标签为准。模型当时选了什么，就重放出什么，
+  // 不能因为这次没有调用模型就退回确定性标签。
+  if (world.replay?.turnings?.length) {
+    const index = world.replay.turnings.findIndex(
+      (t) => t.agentId === agent.id && t.trigger === trigger
+    );
+    if (index >= 0) {
+      const [recorded] = world.replay.turnings.splice(index, 1);
+      return applyTurning(world, agent, trigger, recorded.label, reason);
+    }
+  }
 
   if (world.api.key && agent.useLLM && !world.ruleOnly) {
     world.pendingTurnings.push({ agentId: agent.id, trigger, reason });
@@ -2286,10 +2309,11 @@ export function loadWorld(data) {
   };
 }
 
-export function replayDecisions(world, decisions) {
+export function replayDecisions(world, decisions, turnings = []) {
   world.replay = {
     queue: decisions.map((d) => ({ ...d, action: { ...d.action } })),
     index: 0,
+    turnings: turnings.map((t) => ({ ...t })),
   };
   world.pendingDecisions = [];
   return world;
@@ -2304,6 +2328,7 @@ export function snapshot(world) {
     paused: world.config.paused,
     speed: world.config.speed,
     map: world.map.join(''),
+    labels: { skills: SKILL_LABEL, knowledge: KNOWLEDGE_LABEL, languages: LANGUAGE_LABEL },
     population: world.agents.filter((a) => a.alive).length,
     agents: world.agents.map((a) => ({
       id: a.id,
@@ -2335,6 +2360,13 @@ export function snapshot(world) {
       beliefs: a.beliefs.slice(-10).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
       memory: a.memory.slice(-20),
       letter: a.letter,
+      mentorId: a.mentorId || null,
+      heirId: a.heirId || null,
+      heirKind: a.heirKind || null,
+      inheritedFrom: a.inheritedFrom || null,
+      relationships: { ...a.relationships },
+      letterCooldownUntil: a.letterCooldownUntil || 0,
+      letterCooldownLeft: letterCooldownLeft(world, a),
       useLLM: a.useLLM,
       lastSay: a.lastSay,
       inventory: { ...a.inventory },

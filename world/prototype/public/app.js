@@ -2,33 +2,161 @@ const W = 40;
 const H = 40;
 const TS = 16;
 
-const canvas = document.getElementById('map');
+const $ = (id) => document.getElementById(id);
+
+const canvas = $('map');
 const ctx = canvas.getContext('2d');
-const clockEl = document.getElementById('clock');
-const popEl = document.getElementById('pop');
-const logEl = document.getElementById('log');
-const agentInfoEl = document.getElementById('agentInfo');
-const pauseBtn = document.getElementById('pauseBtn');
-const hintEl = document.getElementById('hint');
-const whisperForm = document.getElementById('whisperForm');
-const whisperInput = document.getElementById('whisperInput');
+const clockEl = $('clock');
+const popEl = $('pop');
+const syncStatusEl = $('syncStatus');
+const logEl = $('log');
+const agentInfoEl = $('agentInfo');
+const pauseBtn = $('pauseBtn');
+const hintEl = $('hint');
+const whisperForm = $('whisperForm');
+const whisperInput = $('whisperInput');
 const whisperBtn = whisperForm.querySelector('button');
-const configForm = document.getElementById('configForm');
-const brainStatus = document.getElementById('brainStatus');
+const whisperNote = $('whisperNote');
+const configForm = $('configForm');
+const brainStatus = $('brainStatus');
+const modesEl = $('modes');
+const followBadge = $('followBadge');
+const tlDays = $('tlDays');
+const tlNow = $('tlNow');
+const returnPanel = $('returnPanel');
+const returnBody = $('returnBody');
+const dismissReturnBtn = $('dismissReturn');
+const islandPanel = $('islandPanel');
+const selectedPanel = $('selectedPanel');
+const islandBody = $('islandBody');
+const chronicleRange = $('chronicleRange');
+const chronicleBody = $('chronicleBody');
+const narrateBtn = $('narrateBtn');
+const todayBtn = $('todayBtn');
 
 const TILE_COLORS = ['#16232b', '#2b3630', '#1f2f25', '#3c3c39', '#4b3d34', '#33452b'];
 
+const SOURCE_LABEL = {
+  self: '亲身',
+  sight: '亲眼',
+  hearsay: '转述',
+  inherited: '继承',
+  doctrine: '教义',
+  relationship: '关系',
+  death: '死亡',
+  letter: '祖先的声音',
+};
+
+const FACT_LABEL = {
+  death: '死亡',
+  turning: '脱变',
+  teach: '教学',
+  talk: '交谈',
+  adopt: '收养',
+  institution: '制度',
+  punish: '违规',
+  fight: '冲突',
+  build: '建造',
+  craft: '制造',
+  gather: '采集',
+  fish: '捕鱼',
+  plant: '耕种',
+  rest: '休息',
+  settle: '搬入',
+  inherit: '继承',
+  bury: '埋葬',
+  grave: '坟',
+  camp: '营地',
+  fade: '淡出',
+};
+
+const RESOURCE_LABEL = { food: '食物', wood: '木头', stone: '石头', weapon: '武器' };
+
+const PARAMS = new URLSearchParams(location.search);
+
 let state = null;
-let selectedId = null;
+let mirrorMode = false;
+let selectedId = PARAMS.get('select') || null;
+let mode = PARAMS.get('mode') === 'island' ? 'island' : 'follow';
+let agentTab = 'facts';
+let selectedDay = null;
+let timelineData = { currentDay: 1, days: [] };
+let lastTimelineDay = 0;
+let chronicleToken = 0;
+let chronicleCacheKey = '';
+let lastChronicleDay = 0;
+let chronicleBusy = false;
+let returnDismissed = sessionStorage.getItem('island-return-dismissed') === '1';
+
+const VIEWER_ID = (() => {
+  let id = localStorage.getItem('island-viewer-id');
+  if (!id) {
+    id =
+      (typeof crypto !== 'undefined' && crypto.randomUUID && crypto.randomUUID()) ||
+      `v-${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem('island-viewer-id', id);
+  }
+  return id;
+})();
 
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
 
+function agentById(id) {
+  return state ? state.agents.find((a) => a.id === id) : null;
+}
+
+function nameOf(id) {
+  const a = agentById(id);
+  return a ? a.name : '某个人';
+}
+
+function formatTicks(ticks) {
+  const t = Math.max(0, Math.round(ticks));
+  if (t >= 60) return `${Math.floor(t / 60)} 小时 ${t % 60} 分`;
+  return `${t} 分钟`;
+}
+
+async function refreshSyncStatus() {
+  try {
+    const res = await fetch('/api/identity');
+    const info = await res.json();
+    let text;
+    let status = 'idle';
+    if (info.mirror) {
+      text = info.lastSyncError
+        ? `镜像 · 同步中断：${info.lastSyncError}`
+        : info.lastSyncAt
+          ? `镜像 · 已追到第 ${info.lastSyncedTick} 刻`
+          : '镜像 · 等待主节点';
+      status = info.lastSyncError ? 'error' : info.lastSyncAt ? 'ok' : 'idle';
+    } else if (info.peer) {
+      text = info.lastSyncError
+        ? `同步中断：${info.lastSyncError}`
+        : info.lastSyncAt
+          ? `已同步到第 ${info.lastSyncedTick} 刻`
+          : '正在连接镜像';
+      status = info.lastSyncError ? 'error' : info.lastSyncAt ? 'ok' : 'idle';
+    } else {
+      text = '单机 · 未配置同步';
+    }
+    mirrorMode = !!info.mirror;
+    syncStatusEl.textContent = text;
+    syncStatusEl.title = `${info.nodeId} · seed ${info.seed} · ${text}`;
+    syncStatusEl.dataset.state = status;
+    if (state) updateUI();
+  } catch {
+    syncStatusEl.textContent = '同步状态未知';
+    syncStatusEl.dataset.state = 'error';
+  }
+}
+
+// ---------- 地图 ----------
+
 function render() {
   if (!state) return;
 
-  // 地形
   for (let y = 0; y < H; y++) {
     for (let x = 0; x < W; x++) {
       const t = state.map.charCodeAt(y * W + x) - 48;
@@ -37,19 +165,13 @@ function render() {
     }
   }
 
-  // 夜
   if (state.isNight) {
     ctx.fillStyle = 'rgba(3,7,18,0.46)';
     ctx.fillRect(0, 0, W * TS, H * TS);
   }
 
-  // 建筑
   for (const s of state.structures) drawStructure(s);
-
-  // 野兽
   for (const w of state.wolves) drawWolf(w);
-
-  // 人
   for (const a of state.agents) {
     if (a.alive) drawAgent(a);
   }
@@ -162,42 +284,116 @@ function drawAgent(a) {
   ctx.fillText(label, cx, cy - 13);
 }
 
+// ---------- 跟随 ----------
+
+function lineageChain(a) {
+  const byId = new Map(state.agents.map((x) => [x.id, x]));
+  const up = [];
+  const seen = new Set([a.id]);
+  let cur = a;
+  while (cur.mentorId && !seen.has(cur.mentorId)) {
+    seen.add(cur.mentorId);
+    cur = byId.get(cur.mentorId);
+    if (!cur) break;
+    up.unshift(cur);
+  }
+
+  const down = [];
+  const seenDown = new Set([a.id]);
+  cur = a;
+  while (cur.heirId && !seenDown.has(cur.heirId)) {
+    seenDown.add(cur.heirId);
+    cur = byId.get(cur.heirId);
+    if (!cur) break;
+    down.push(cur);
+  }
+  return [...up, a, ...down];
+}
+
+function renderLineage(a) {
+  const chain = lineageChain(a);
+  if (chain.length === 1) {
+    return `<div class="lineage"><span class="empty">还没有师承或继承人。</span></div>`;
+  }
+  const parts = chain.map((x) => {
+    const cls = x.id === a.id ? 'me' : x.alive ? '' : 'dead';
+    return `<span class="${cls}">${escapeHtml(x.name)}</span>`;
+  });
+  return `<div class="lineage">${parts.join('<span class="arrow">→</span>')}</div>`;
+}
+
 function bar(label, value, cls) {
   return `<div class="bar"><span>${label}</span><div class="track"><div class="fill ${cls}" style="width:${Math.max(0, Math.min(100, value))}%"></div></div></div>`;
 }
 
-function updateUI() {
-  if (!state) return;
+function agentFacts(a) {
+  return (state.facts || [])
+    .filter((f) => f.subjectId === a.id || f.targetId === a.id || f.killerId === a.id)
+    .slice(-10)
+    .reverse();
+}
 
-  clockEl.textContent = `第 ${state.day} 天 · ${state.clock}${state.isNight ? ' · 夜' : ''}`;
-  popEl.textContent = `活着 ${state.population} / ${state.agents.length}`;
-  pauseBtn.textContent = state.paused ? '继续' : '暂停';
-
-  if (brainStatus) {
-    brainStatus.textContent = state.apiConfigured
-      ? `当前：${state.llmAgents}/${state.agents.length} 人由你的模型驱动 · 已调用 ${state.llmCalls} 次${state.llmErrors ? ` · 失败 ${state.llmErrors}` : ''}`
-      : '当前：规则驱动（未配置 API）。';
+function tabBody(a) {
+  if (agentTab === 'beliefs') {
+    if (!a.beliefs.length) return `<div class="tab-body"><span class="empty">还没有形成任何看法。</span></div>`;
+    return `<div class="tab-body">${a.beliefs
+      .slice()
+      .reverse()
+      .map(
+        (b) =>
+          `<div class="row">${escapeHtml(b.proposition)}<span class="conf">${Math.round(
+            (b.confidence ?? 0) * 100
+          )}%</span><span class="src">${escapeHtml(SOURCE_LABEL[b.source] || b.source || '')}</span></div>`
+      )
+      .join('')}</div>`;
   }
 
-  document.querySelectorAll('.speed').forEach((b) => {
-    b.classList.toggle('active', Number(b.dataset.speed) === state.speed);
-  });
+  if (agentTab === 'memory') {
+    if (!a.memory.length) return `<div class="tab-body"><span class="empty">还没有记住什么。</span></div>`;
+    return `<div class="tab-body">${a.memory
+      .slice()
+      .reverse()
+      .map((m) => `<div class="row">· ${escapeHtml(m)}</div>`)
+      .join('')}</div>`;
+  }
 
-  logEl.innerHTML = state.log
-    .slice(-30)
-    .reverse()
-    .map((e) => `<li class="${e.type}"><span class="t">${e.day}日 ${e.clock}</span>${escapeHtml(e.text)}</li>`)
-    .join('');
+  const facts = agentFacts(a);
+  if (!facts.length) return `<div class="tab-body"><span class="empty">最近没有关于他的事实。</span></div>`;
+  return `<div class="tab-body">${facts
+    .map((f) => {
+      const label = FACT_LABEL[f.type] || f.type;
+      let detail = typeof f.object === 'string' ? f.object : '';
+      if (f.type === 'teach') {
+        detail =
+          state.labels?.knowledge?.[f.object] ||
+          state.labels?.skills?.[f.object] ||
+          state.labels?.languages?.[f.object] ||
+          f.object;
+      } else if (f.type === 'gather' || f.type === 'fish') {
+        detail = RESOURCE_LABEL[detail] || detail;
+      } else if (f.type === 'build' || f.type === 'craft') {
+        detail = state.labels?.skills?.[detail] || detail;
+      } else if (f.type === 'adopt' || /^[a-z]\d+$/.test(detail)) {
+        detail = '';
+      }
+      return `<div class="row">第 ${f.day} 天 · ${escapeHtml(label)}${
+        detail ? ` · ${escapeHtml(detail)}` : ''
+      }</div>`;
+    })
+    .join('')}</div>`;
+}
 
-  const a = state.agents.find((x) => x.id === selectedId);
+function renderAgentPanel() {
+  const a = agentById(selectedId);
   const alive = a && a.alive;
 
-  whisperInput.disabled = !alive;
-  whisperBtn.disabled = !alive;
+  whisperInput.disabled = mirrorMode || !alive || (a && a.letterCooldownLeft > 0);
+  whisperBtn.disabled = whisperInput.disabled;
 
   if (!a) {
     agentInfoEl.className = 'muted';
     agentInfoEl.textContent = '还没有选中任何人。点地图上的一个人。';
+    whisperNote.textContent = '';
     return;
   }
 
@@ -208,9 +404,12 @@ function updateUI() {
       <b>${escapeHtml(a.name)}</b>
       ${a.useLLM ? '<span class="badge">LLM</span>' : ''}
       ${!a.alive ? '<span class="badge" style="color:#d98b82;border-color:#5a3a36">已死</span>' : ''}
+      ${a.identity ? `<span class="badge">${escapeHtml(a.identity)}</span>` : ''}
     </div>
+    ${renderLineage(a)}
+    ${a.inheritedFrom ? `<div class="lineage">继承自 <span class="me">${escapeHtml(a.inheritedFrom)}</span></div>` : ''}
     <div class="tags">
-      <b>出身</b> ${escapeHtml(a.tags.origin)}<br>
+      <b>出身</b> ${escapeHtml(a.tags.origin)} · <b>家乡</b> ${escapeHtml(a.tags.hometown || '')}<br>
       <b>执念</b> ${escapeHtml(a.tags.obsession)}<br>
       <b>禀赋</b> ${escapeHtml(a.tags.aptitude)}<br>
       <b>旧伤</b> ${escapeHtml(a.tags.wound)}
@@ -218,21 +417,376 @@ function updateUI() {
     ${bar('生命', a.hp, 'hp')}
     ${bar('饱食', a.hunger, 'hunger')}
     ${bar('体力', a.energy, 'energy')}
-    <div class="inv">食物 ${a.inventory.food} · 木头 ${a.inventory.wood} · 石头 ${a.inventory.stone}${a.inventory.weapon ? ' · 有武器' : ''}</div>
-    ${a.lastSay ? `<div class="say">「${escapeHtml(a.lastSay)}」</div>` : ''}
-    ${a.letter ? `<div class="say" style="border-color:#6a4a7a">祖先的声音：${escapeHtml(a.letter)}</div>` : ''}
-    <div class="mem"><div class="mem-title">个人史 · 最近 ${a.memory.length} 条</div>${a.memory
-      .map((m) => `<div>· ${escapeHtml(m)}</div>`)
-      .join('')}</div>
-    ${a.trace && a.trace.length
-      ? `<div class="trace"><div class="mem-title">最后 ${a.trace.length} 步</div>${a.trace
-          .slice()
+    <div class="inv">食物 ${a.inventory.food} · 木头 ${a.inventory.wood} · 石头 ${a.inventory.stone}${
+      a.inventory.weapon ? ' · 有武器' : ''
+    }</div>
+    <div class="remembrance">${
+      a.faded
+        ? '<span class="gone">已经被世界抹去。</span>'
+        : `被记住 <b>${a.remembrance}</b> / 100${
+            a.fadeStage ? ` <span class="low">· 正在淡出（${a.fadeStage}/3）</span>` : ''
+          }`
+    }</div>
+    ${a.turningPoints.length
+      ? `<div class="turning-list">${a.turningPoints
+          .slice(-3)
           .reverse()
-          .map((t) => `<div>· 第${t.t}刻 (${t.x},${t.y}) ${escapeHtml(t.note)}</div>`)
+          .map(
+            (t) =>
+              `<div>第 ${t.day} 天 · ${escapeHtml(t.label)} <span class="r">${escapeHtml(
+                t.reason || ''
+              )}</span></div>`
+          )
           .join('')}</div>`
       : ''}
+    ${a.lastSay ? `<div class="say">「${escapeHtml(a.lastSay)}」</div>` : ''}
+    ${a.letter ? `<div class="say" style="border-color:#6a4a7a">祖先的声音：${escapeHtml(a.letter)}</div>` : ''}
+    <div class="agent-tabs">
+      <button data-tab="facts" class="${agentTab === 'facts' ? 'active' : ''}">事实</button>
+      <button data-tab="beliefs" class="${agentTab === 'beliefs' ? 'active' : ''}">他的看法</button>
+      <button data-tab="memory" class="${agentTab === 'memory' ? 'active' : ''}">个人史</button>
+    </div>
+    ${tabBody(a)}
+  `;
+
+  if (!alive) {
+    whisperNote.textContent = '他已经不在了。';
+  } else if (a.letterCooldownLeft > 0) {
+    whisperNote.textContent = `祖先的声音要等一等：约 ${formatTicks(a.letterCooldownLeft)}后。`;
+  } else if (whisperNote.textContent.startsWith('祖先的声音要等一等')) {
+    whisperNote.textContent = '';
+  }
+}
+
+// ---------- 全岛 ----------
+
+function renderIslandPanel() {
+  if (!state) return;
+  const alive = state.agents.filter((a) => a.alive);
+  const dead = state.agents.filter((a) => !a.alive);
+  const remembered = alive
+    .slice()
+    .sort((a, b) => b.remembrance - a.remembrance)
+    .slice(0, 5);
+  const fading = alive.filter((a) => a.fadeStage > 0);
+
+  const langCount = {};
+  for (const a of alive) {
+    for (const key of Object.keys(a.languages || {})) {
+      if (a.languages[key]) langCount[key] = (langCount[key] || 0) + 1;
+    }
+  }
+  const langs = Object.entries(langCount)
+    .map(([k, n]) => `${escapeHtml(state.labels?.languages?.[k] || k)} ${n}`)
+    .join(' · ');
+
+  const institutions = state.institutions.length
+    ? state.institutions
+        .slice()
+        .reverse()
+        .map(
+          (i) =>
+            `<div class="row">${escapeHtml(i.description)}${i.members?.length ? ` · ${i.members.length} 人` : ''}</div>`
+        )
+        .join('')
+    : '<div class="row">还没有制度。</div>';
+
+  const chronicle = state.chronicle.length
+    ? state.chronicle
+        .slice(-6)
+        .reverse()
+        .map(
+          (c) =>
+            `<div class="row"><span class="t">第 ${c.day} 天</span> ${escapeHtml(
+              c.agentId ? nameOf(c.agentId) : ''
+            )} ${escapeHtml(c.label || c.kind)}</div>`
+        )
+        .join('')
+    : '<div class="row">还没有值得记下的事。</div>';
+
+  islandBody.innerHTML = `
+    <div class="island-grid">
+      <div>活着 <b>${alive.length}</b></div>
+      <div>死去 <b>${dead.length}</b></div>
+      <div>制度 <b>${state.institutions.filter((i) => i.active).length}</b></div>
+      <div>正在淡出 <b>${fading.length}</b></div>
+    </div>
+    <div class="island-section">
+      <div class="sub">语言</div>
+      <div class="row">${langs || '—'}</div>
+    </div>
+    <div class="island-section">
+      <div class="sub">被记住的人</div>
+      ${remembered
+        .map(
+          (a) =>
+            `<div class="row"><span class="who">${escapeHtml(a.name)}</span> · ${a.remembrance}${
+              a.fadeStage ? ` · 淡出 ${a.fadeStage}/3` : ''
+            }</div>`
+        )
+        .join('')}
+      ${fading.length ? `<div class="row">正在淡出：${fading.map((a) => escapeHtml(a.name)).join('、')}</div>` : ''}
+    </div>
+    <div class="island-section">
+      <div class="sub">制度</div>
+      ${institutions}
+    </div>
+    <div class="island-section">
+      <div class="sub">编年史</div>
+      ${chronicle}
+    </div>
+    <div class="island-section">
+      <div class="sub">已经不在了</div>
+      <div class="row">${dead.length ? dead.map((a) => escapeHtml(a.name)).join('、') : '还没有人死去。'}</div>
+    </div>
   `;
 }
+
+// ---------- 时间轴与编年史 ----------
+
+function renderTimeline() {
+  if (!state) return;
+  const current = state.day || 1;
+  const byDay = new Map((timelineData.days || []).map((d) => [d.day, d]));
+
+  tlNow.textContent = selectedDay
+    ? `正在看第 ${selectedDay} 天 · 点「今天」回到现在`
+    : `正在看第 ${current} 天`;
+  const chips = [];
+  for (let d = 1; d <= current; d++) {
+    const info = byDay.get(d);
+    const dashes = info
+      ? [
+          info.deaths ? '<span class="dash death"></span>' : '',
+          info.turnings ? '<span class="dash turning"></span>' : '',
+          info.institutions ? '<span class="dash institution"></span>' : '',
+          info.conflicts ? '<span class="dash conflict"></span>' : '',
+        ].join('')
+      : '';
+    const classes = ['tl-day'];
+    if (selectedDay === d) classes.push('active');
+    if (d === current) classes.push('today');
+    chips.push(
+      `<button class="${classes.join(' ')}" data-day="${d}"><div class="n">第 ${d} 天</div><div class="dashes">${dashes}</div></button>`
+    );
+  }
+  tlDays.innerHTML = chips.join('');
+  tlDays.querySelectorAll('.tl-day').forEach((btn) => {
+    btn.addEventListener('click', () => selectDay(Number(btn.dataset.day)));
+  });
+
+  const focus = tlDays.querySelector('.tl-day.active') || tlDays.querySelector('.tl-day.today');
+  if (focus) {
+    requestAnimationFrame(() => {
+      focus.scrollIntoView({ block: 'nearest', inline: 'center' });
+    });
+  }
+}
+
+async function fetchTimeline() {
+  try {
+    const res = await fetch('/api/timeline');
+    const data = await res.json();
+    timelineData = { currentDay: data.currentDay || 1, days: data.days || [] };
+    renderTimeline();
+  } catch {
+    /* keep the old timeline */
+  }
+}
+
+function selectDay(day) {
+  selectedDay = day;
+  renderTimeline();
+  loadChronicle(day, day);
+}
+
+function currentDay() {
+  return (state && state.day) || 1;
+}
+
+function renderChronicle(data) {
+  const facts = data.facts || [];
+  const source = data.model
+    ? data.fallback
+      ? '模型没有回应，用的是本地叙事'
+      : '你的模型写的版本'
+    : '本地叙事（没有配置模型）';
+  const factLines = facts.length
+    ? facts
+        .map(
+          (f) =>
+            `<div class="fact"><span class="t">${f.day}日 ${escapeHtml(f.clock || '')}</span>${escapeHtml(
+              f.text
+            )}</div>`
+        )
+        .join('')
+    : '<div class="fact">这一段时间没有关键事件。</div>';
+
+  chronicleBody.className = '';
+  chronicleBody.innerHTML = `
+    <div class="source">${escapeHtml(source)}${data.cached ? ' · 已缓存' : ''}</div>
+    <div class="narrative">${escapeHtml(data.narrative || '')}</div>
+    <div class="source">那天的事实 · ${facts.length} 条</div>
+    ${factLines}
+  `;
+}
+
+async function loadChronicle(fromDay, toDay, { force = false } = {}) {
+  const key = `${fromDay}-${toDay}`;
+  if (!force && key === chronicleCacheKey && chronicleBody.querySelector('.narrative')) return;
+
+  const token = ++chronicleToken;
+  chronicleBusy = true;
+  chronicleRange.textContent = fromDay === toDay ? `第 ${fromDay} 天` : `第 ${fromDay}–${toDay} 天`;
+  chronicleBody.className = 'muted';
+  chronicleBody.textContent = '正在写…';
+
+  try {
+    const res = await fetch('/api/chronicle', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ viewerId: VIEWER_ID, fromDay, toDay }),
+    });
+    const data = await res.json();
+    if (token !== chronicleToken) return;
+    if (!data.ok) throw new Error(data.error || '生成失败');
+    chronicleCacheKey = key;
+    if (!selectedDay) lastChronicleDay = currentDay();
+    renderChronicle(data);
+  } catch (err) {
+    if (token !== chronicleToken) return;
+    chronicleBody.className = 'muted';
+    chronicleBody.textContent = `编年史没有写成：${err.message}`;
+  } finally {
+    if (token === chronicleToken) chronicleBusy = false;
+  }
+}
+
+// ---------- 你不在的时候 ----------
+
+function renderReturnSummary() {
+  const s = state && state.returnSummary;
+  const hasNews = s && (s.ticks > 0 || (s.keyEvents && s.keyEvents.length) || (s.gone && s.gone.length));
+  if (!hasNews || returnDismissed) {
+    returnPanel.hidden = true;
+    return;
+  }
+  returnPanel.hidden = false;
+
+  const gone = (s.gone || []).map(nameOf);
+  const items = (s.keyEvents || [])
+    .slice(-12)
+    .reverse()
+    .map(
+      (e) =>
+        `<div class="item"><span class="t">${e.day}日 ${escapeHtml(e.clock || '')}</span>${escapeHtml(
+          e.text || ''
+        )}</div>`
+    )
+    .join('');
+
+  returnBody.innerHTML = `
+    <div>世界往前走了 ${s.ticks} 个世界分钟${s.skippedTicks ? `；太久了，另有 ${s.skippedTicks} 分钟没有模拟` : ''}。</div>
+    ${gone.length ? `<div>不在了：${gone.map(escapeHtml).join('、')}。</div>` : ''}
+    ${s.moved?.length ? `<div>${s.moved.length} 个人换了地方。</div>` : ''}
+    ${items || '<div>没有发生值得记下的事。</div>'}
+  `;
+}
+
+dismissReturnBtn.addEventListener('click', () => {
+  returnDismissed = true;
+  sessionStorage.setItem('island-return-dismissed', '1');
+  returnPanel.hidden = true;
+});
+
+// ---------- 总的 UI ----------
+
+function updateUI() {
+  if (!state) return;
+
+  clockEl.textContent = `第 ${state.day} 天 · ${state.clock}${state.isNight ? ' · 夜' : ''}`;
+  popEl.textContent = `活着 ${state.population} / ${state.agents.length}`;
+  pauseBtn.textContent = state.paused ? '继续' : '暂停';
+  pauseBtn.disabled = mirrorMode;
+  document.querySelectorAll('.speed').forEach((b) => {
+    b.disabled = mirrorMode;
+  });
+
+  if (brainStatus) {
+    brainStatus.textContent = state.apiConfigured
+      ? `当前：${state.llmAgents}/${state.agents.length} 人由你的模型驱动 · 已调用 ${state.llmCalls} 次${
+          state.llmErrors ? ` · 失败 ${state.llmErrors}` : ''
+        }`
+      : '当前：规则驱动（未配置 API）。';
+  }
+
+  modesEl.querySelectorAll('.mode').forEach((b) => {
+    b.classList.toggle('active', b.dataset.mode === mode);
+  });
+  document.querySelectorAll('.speed').forEach((b) => {
+    b.classList.toggle('active', Number(b.dataset.speed) === state.speed);
+  });
+
+  selectedPanel.hidden = mode !== 'follow';
+  islandPanel.hidden = mode !== 'island';
+
+  if (mode === 'follow' && selectedId) {
+    const a = agentById(selectedId);
+    followBadge.hidden = false;
+    followBadge.textContent = a
+      ? `跟随：${a.name}${a.identity ? ` · ${a.identity}` : ''}${a.alive ? '' : ' · 已死'}`
+      : '';
+  } else {
+    followBadge.hidden = true;
+  }
+
+  renderAgentPanel();
+  if (mode === 'island') renderIslandPanel();
+
+  logEl.innerHTML = state.log
+    .slice(-30)
+    .reverse()
+    .map((e) => {
+      let tag = '';
+      if (e.type === 'talk' && e.payload) {
+        const label = e.payload.understood
+          ? state.labels?.languages?.[e.payload.language] || ''
+          : '另一边只听见声音';
+        tag = `<span class="lang">${escapeHtml(label)}</span>`;
+      }
+      return `<li class="${e.type}"><span class="t">${e.day}日 ${e.clock}</span>${escapeHtml(e.text)}${tag}</li>`;
+    })
+    .join('');
+
+  renderReturnSummary();
+
+  if (state.day !== lastTimelineDay) {
+    lastTimelineDay = state.day;
+    fetchTimeline();
+  }
+
+  // 停在“今天”时，每过一天自动换一份新的编年史；看旧日时不打扰。
+  if (bootstrapped && !selectedDay && !chronicleBusy && state.day !== lastChronicleDay) {
+    lastChronicleDay = state.day;
+    loadChronicle(currentDay(), currentDay());
+  }
+}
+
+// ---------- 交互 ----------
+
+modesEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('.mode');
+  if (!btn) return;
+  mode = btn.dataset.mode;
+  updateUI();
+});
+
+agentInfoEl.addEventListener('click', (e) => {
+  const btn = e.target.closest('[data-tab]');
+  if (!btn) return;
+  agentTab = btn.dataset.tab;
+  renderAgentPanel();
+});
 
 canvas.addEventListener('click', (e) => {
   if (!state) return;
@@ -252,6 +806,8 @@ canvas.addEventListener('click', (e) => {
   }
   if (best && bd < 1.5) {
     selectedId = best.id;
+    agentTab = 'facts';
+    if (mode !== 'follow') mode = 'follow';
     hintEl.style.display = 'none';
     updateUI();
   }
@@ -281,12 +837,27 @@ whisperForm.addEventListener('submit', async (e) => {
   if (!selectedId) return;
   const text = whisperInput.value.trim();
   if (!text) return;
-  await fetch('/api/whisper', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ agentId: selectedId, text }),
-  });
-  whisperInput.value = '';
+  whisperNote.textContent = '正在送出去…';
+  try {
+    const res = await fetch('/api/whisper', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: selectedId, text }),
+    });
+    const data = await res.json();
+    if (data.ok) {
+      whisperInput.value = '';
+      whisperNote.textContent = data.heard
+        ? `他听见了。还要等约 ${formatTicks(data.cooldownLeft || 0)}才能再写。`
+        : '他听见了一个声音，但没有听懂。';
+    } else if (data.error === 'cooldown') {
+      whisperNote.textContent = `还没到时候：约 ${formatTicks(data.cooldownLeft || 0)}后。`;
+    } else {
+      whisperNote.textContent = '这句话没有送到。';
+    }
+  } catch {
+    whisperNote.textContent = '这句话没有送到。';
+  }
 });
 
 configForm.addEventListener('submit', async (e) => {
@@ -311,18 +882,52 @@ configForm.addEventListener('submit', async (e) => {
   }
 });
 
-const es = new EventSource('/stream');
-es.onmessage = (e) => {
-  try {
-    state = JSON.parse(e.data);
-    render();
-    updateUI();
-  } catch {
-    /* ignore malformed frame */
-  }
-};
+narrateBtn.addEventListener('click', () => {
+  const d = selectedDay || currentDay();
+  loadChronicle(d, d, { force: true });
+});
 
-es.onerror = () => {
-  hintEl.textContent = '连接断开了，正在重连…';
-  hintEl.style.display = 'block';
-};
+todayBtn.addEventListener('click', () => {
+  selectedDay = null;
+  renderTimeline();
+  loadChronicle(currentDay(), currentDay(), { force: true });
+});
+
+let bootstrapped = false;
+function acceptState(next) {
+  state = next;
+  render();
+  updateUI();
+  if (!bootstrapped) {
+    bootstrapped = true;
+    fetchTimeline();
+    loadChronicle(currentDay(), currentDay());
+  }
+}
+
+refreshSyncStatus();
+setInterval(refreshSyncStatus, 5000);
+
+// ?static=1：不接 SSE，只拉一次状态。给截图和离线调试用。
+if (PARAMS.has('static')) {
+  fetch('/api/state')
+    .then((r) => r.json())
+    .then(acceptState)
+    .catch(() => {
+      hintEl.textContent = '没有连上世界。';
+      hintEl.style.display = 'block';
+    });
+} else {
+  const es = new EventSource('/stream');
+  es.onmessage = (e) => {
+    try {
+      acceptState(JSON.parse(e.data));
+    } catch {
+      /* ignore malformed frame */
+    }
+  };
+  es.onerror = () => {
+    hintEl.textContent = '连接断开了，正在重连…';
+    hintEl.style.display = 'block';
+  };
+}
