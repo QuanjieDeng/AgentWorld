@@ -224,7 +224,7 @@ export function createWorld(seed = 20261102) {
     regrow: [],
     pendingDecisions: [],
     rng: mulberry32(seed ^ 0x9e3779b9),
-    config: { paused: false, speed: 1, llmAgents: 0 },
+    config: { paused: false, speed: 1, llmAgents: 0, distortionChance: DEFAULT_DISTORTION },
     api: { provider: 'openai', base: '', key: '', model: '' },
     inflight: 0,
     nextWolfId: 1,
@@ -343,17 +343,149 @@ export function recordFact(world, fact) {
   return entry;
 }
 
-export function recordBelief(world, agent, proposition, source, confidence = 0.8) {
+function copyClaim(claim) {
+  return claim ? { ...claim } : null;
+}
+
+export function recordBelief(world, agent, proposition, source, confidence = 0.8, claim = null) {
   const entry = {
     id: 'b' + world.nextBeliefId++,
     t: world.tick,
     proposition,
     source,
     confidence,
+    claim: copyClaim(claim),
   };
   agent.beliefs.push(entry);
   if (agent.beliefs.length > 200) agent.beliefs.shift();
   return entry;
+}
+
+const PREDICATE_LADDER = {
+  said: ['said', 'threatened'],
+  died: ['died', 'was killed'],
+  hit: ['hit', 'wounded', 'killed'],
+  built: ['built', 'burned'],
+};
+
+const DEFAULT_DISTORTION = 0.55;
+
+const PLACES = ['水边', '营地', '树林', '废墟', '空地'];
+
+const BUILD_NAMES = { fire: '火堆', shelter: '窝棚', wall: '墙' };
+
+function nameOf(world, id) {
+  return world.agents.find((a) => a.id === id)?.name || '某个人';
+}
+
+function dayOf(t) {
+  return Math.floor(t / TICKS_PER_DAY) + 1;
+}
+
+function placeName(world, x, y) {
+  const tile = world.map[y * W + x];
+  if (tile === TILE.WATER) return '水边';
+  if (world.structures.some((s) => s.type === 'camp' && Math.abs(s.x - x) + Math.abs(s.y - y) <= 3)) return '营地';
+  if (tile === TILE.TREE) return '树林';
+  if (tile === TILE.RUIN) return '废墟';
+  return '空地';
+}
+
+function distortClaim(world, claim) {
+  const chance = world.config.distortionChance ?? DEFAULT_DISTORTION;
+  if (world.rng() >= chance) return { ...claim };
+
+  const distorted = { ...claim };
+  const options = [];
+  if (typeof distorted.quantity === 'number') options.push('quantity');
+  if (typeof distorted.time === 'number') options.push('time');
+  if (distorted.place) options.push('place');
+  if (distorted.targetId) options.push('dropTarget');
+  if (PREDICATE_LADDER[distorted.predicate]) options.push('predicate');
+  if (!options.length) return distorted;
+
+  const op = options[Math.floor(world.rng() * options.length)];
+  if (op === 'quantity') distorted.quantity += 1 + Math.floor(world.rng() * 3);
+  if (op === 'time') distorted.time = Math.max(0, distorted.time - (1 + Math.floor(world.rng() * 3)) * TICKS_PER_DAY);
+  if (op === 'place') {
+    const elsewhere = PLACES.filter((p) => p !== distorted.place);
+    distorted.place = elsewhere[Math.floor(world.rng() * elsewhere.length)];
+  }
+  if (op === 'dropTarget') delete distorted.targetId;
+  if (op === 'predicate') {
+    const ladder = PREDICATE_LADDER[distorted.predicate];
+    const index = ladder.indexOf(distorted.predicate);
+    distorted.predicate = ladder[Math.min(ladder.length - 1, index + 1)];
+  }
+  return distorted;
+}
+
+function renderClaim(world, claim) {
+  const subject = nameOf(world, claim.subjectId);
+  const where = claim.place ? `在${claim.place}` : '';
+  const when = typeof claim.time === 'number' ? `第${dayOf(claim.time)}天` : '';
+  if (claim.kind === 'death') {
+    return claim.predicate === 'was killed' ? `${subject}被人杀了。` : `${subject}死了。${claim.object || ''}`;
+  }
+  if (claim.kind === 'build') {
+    const what = BUILD_NAMES[claim.object] || claim.object;
+    return claim.predicate === 'burned'
+      ? `${subject}${when}${where}烧了${what}。`
+      : `${subject}${when}${where}建了${what}。`;
+  }
+  if (claim.kind === 'talk') {
+    return claim.predicate === 'threatened'
+      ? `${subject}${when}${where}威胁说：「${claim.object}」`
+      : `${subject}${when}${where}说：「${claim.object}」`;
+  }
+  if (claim.kind === 'gather') {
+    const what = claim.object === 'stone' ? '石头' : '食物';
+    return `${subject}${when}${where}采到了${claim.quantity ?? 1}份${what}。`;
+  }
+  if (claim.kind === 'fight') {
+    const target = nameOf(world, claim.targetId);
+    if (claim.predicate === 'killed') return `${subject}打死了${target}。`;
+    if (claim.predicate === 'wounded') return `${subject}打伤了${target}。`;
+    return `${subject}打了${target}。`;
+  }
+  if (claim.kind === 'teach') {
+    return `${subject}教了${nameOf(world, claim.targetId)}${KNOWLEDGE_LABEL[claim.object] || claim.object}。`;
+  }
+  return `你听说了一件关于${subject}的事。`;
+}
+
+function retellBelief(world, speaker, listener) {
+  const eligible = (b) =>
+    b.claim &&
+    b.confidence > 0.05 &&
+    b.claim.subjectId !== listener.id &&
+    !listener.beliefs.some(
+      (heard) =>
+        heard.claim && heard.claim.kind === b.claim.kind && heard.claim.subjectId === b.claim.subjectId
+    );
+  // 先说别人的事；没有别人的事，才说自己的。死亡比闲话更值得传。
+  const rank = { death: 0, fight: 1, build: 2, gather: 3, teach: 4, talk: 5 };
+  const source = speaker.beliefs
+    .map((belief, index) => ({ belief, index }))
+    .filter(({ belief }) => eligible(belief))
+    .sort((a, b) => {
+      const aboutSpeaker = (x) => (x.belief.claim.subjectId === speaker.id ? 1 : 0);
+      return (
+        aboutSpeaker(a) - aboutSpeaker(b) ||
+        (rank[a.belief.claim.kind] ?? 9) - (rank[b.belief.claim.kind] ?? 9) ||
+        a.index - b.index
+      );
+    })[0]?.belief;
+  if (!source) return null;
+
+  const claim = distortClaim(world, source.claim);
+  const confidence = Math.max(0.05, source.confidence * 0.8);
+  logEvent(world, 'retell', `${speaker.name}对${listener.name}说起${nameOf(world, claim.subjectId)}。`, speaker.id, {
+    claim: { ...claim },
+  });
+  const belief = recordBelief(world, listener, renderClaim(world, claim), 'hearsay', confidence, claim);
+  belief.sourceAgentId = speaker.id;
+  return belief;
 }
 
 function recordTeaching(world, teacher, student, { key, kind, label }) {
@@ -375,7 +507,8 @@ function recordTeaching(world, teacher, student, { key, kind, label }) {
     student,
     completed ? `${teacher.name}教会你${label}。` : `${teacher.name}教了你一点${label}。`,
     'taught',
-    completed ? 0.95 : 0.8
+    completed ? 0.95 : 0.8,
+    { kind: 'teach', subjectId: teacher.id, predicate: 'taught', object: key, targetId: student.id }
   );
   remember(teacher, text);
   remember(student, completed ? `${teacher.name}教会你${label}。` : `${teacher.name}教了你一点${label}。`);
@@ -461,15 +594,29 @@ function nearFire(world, x, y, r = 2) {
   return world.structures.some((s) => s.type === 'fire' && Math.abs(s.x - x) + Math.abs(s.y - y) <= r);
 }
 
-export function kill(world, a, cause) {
+export function kill(world, a, cause, killerId = null) {
   if (!a.alive) return;
   a.alive = false;
   a.hp = 0;
   a.action = null;
   a.queuedAction = null;
   world.structures.push({ type: 'grave', x: a.x, y: a.y, name: a.name });
+  const claim = {
+    kind: 'death',
+    subjectId: a.id,
+    predicate: 'died',
+    object: cause,
+    killerId: killerId || null,
+  };
   const death = logEvent(world, 'death', `${a.name}死了。${cause}`, a.id);
-  recordFact(world, { type: 'death', subjectId: a.id, predicate: 'died', object: cause, eventSeq: death.seq });
+  recordFact(world, {
+    type: 'death',
+    subjectId: a.id,
+    predicate: 'died',
+    object: cause,
+    killerId: killerId || null,
+    eventSeq: death.seq,
+  });
   emitSound(world, a.x, a.y, 16, 'death', '一声惨叫之后，安静了下来', a.id);
 
   // 坟边的土会变肥：两三天后长出灌木
@@ -490,7 +637,7 @@ export function kill(world, a, cause) {
   for (const other of world.agents) {
     if (other.alive && other.id !== a.id && Math.abs(other.x - a.x) + Math.abs(other.y - a.y) <= 5) {
       remember(other, `${a.name}死了。${cause}`);
-      recordBelief(world, other, `${a.name}死了。${cause}`, 'witness', 0.9);
+      recordBelief(world, other, renderClaim(world, claim), 'witness', 0.9, claim);
     }
   }
 }
@@ -498,7 +645,21 @@ export function kill(world, a, cause) {
 function damage(world, target, amount, by) {
   target.hp -= amount;
   if (target.hp <= 0 && target.alive) {
-    kill(world, target, by ? `死在${by.name}手里。` : '伤重而死。');
+    kill(world, target, by ? `死在${by.name}手里。` : '伤重而死。', by?.id || null);
+  }
+}
+
+// 亲眼看见一个人还活着，就会推翻“他死了”的信念。事实不搬家，信念会。
+function correctBeliefs(world, a) {
+  for (const belief of [...a.beliefs]) {
+    if (belief.corrected || belief.claim?.kind !== 'death') continue;
+    const subject = world.agents.find((o) => o.id === belief.claim.subjectId);
+    if (!subject || !subject.alive) continue;
+    if (Math.abs(subject.x - a.x) + Math.abs(subject.y - a.y) > 3) continue;
+    belief.corrected = true;
+    belief.confidence = 0;
+    recordBelief(world, a, `${subject.name}还活着。我亲眼看见了。`, 'saw', 1);
+    remember(a, `你看见了${subject.name}，他还活着。`);
   }
 }
 
@@ -537,6 +698,8 @@ function stepAgent(world, a) {
     a.cooldownUntil = world.tick + (a.useLLM && world.api.key ? 10 + Math.floor(world.rng() * 8) : 4);
     world.pendingDecisions.push(a);
   }
+
+  correctBeliefs(world, a);
 }
 
 function endAction(world, a, cooldown = 2) {
@@ -591,6 +754,24 @@ function runAction(world, a) {
         remember(a, '你敲下了一些石头。');
       }
       growSkill(a, 'gather', 0.04);
+      recordFact(world, {
+        type: 'gather',
+        subjectId: a.id,
+        predicate: 'gathered',
+        object: spot.t === TILE.ROCK ? 'stone' : 'food',
+        quantity: spot.t === TILE.BUSH ? 2 : 1,
+        x: a.x,
+        y: a.y,
+      });
+      recordBelief(world, a, `你采到了一些东西。`, 'did', 1, {
+        kind: 'gather',
+        subjectId: a.id,
+        predicate: 'gathered',
+        object: spot.t === TILE.ROCK ? 'stone' : 'food',
+        quantity: spot.t === TILE.BUSH ? 2 : 1,
+        place: placeName(world, a.x, a.y),
+        time: world.tick,
+      });
       break;
     }
 
@@ -609,6 +790,15 @@ function runAction(world, a) {
         if (world.rng() < 0.35) {
           a.inventory.food += 1;
           remember(a, '你从水边捕到了一条鱼。');
+          recordFact(world, {
+            type: 'fish',
+            subjectId: a.id,
+            predicate: 'caught',
+            object: 'fish',
+            quantity: 1,
+            x: a.x,
+            y: a.y,
+          });
           growSkill(a, 'fish', 0.06);
         } else {
           remember(a, '你在水边等了很久，什么也没捕到。');
@@ -634,6 +824,14 @@ function runAction(world, a) {
         a.inventory.food -= 1;
         scheduleRegrow(world, a.x, a.y, TILE.BUSH, 2 * TICKS_PER_DAY);
         growSkill(a, 'farm', 0.05);
+        recordFact(world, {
+          type: 'plant',
+          subjectId: a.id,
+          predicate: 'planted',
+          object: 'bush',
+          x: a.x,
+          y: a.y,
+        });
         logEvent(world, 'build', `${a.name}${why}把一份食物埋进土里。`, a.id);
         remember(a, `你${act.reason ? `因为${act.reason}，` : ''}把一份食物埋进土里，等它长出来。`);
       }
@@ -702,6 +900,14 @@ function runAction(world, a) {
           y: a.y,
           eventSeq: built.seq,
         });
+        recordBelief(world, a, `你建起了${names[act.build] || act.build}。`, 'did', 1, {
+          kind: 'build',
+          subjectId: a.id,
+          predicate: 'built',
+          object: act.build,
+          place: placeName(world, a.x, a.y),
+          time: world.tick,
+        });
         if (madeCamp) logEvent(world, 'build', '这里成了一个营地。', a.id);
         remember(a, `你${act.reason ? `因为${act.reason}，` : ''}建起了一个${names[act.build] || act.build}。`);
         emitSound(world, a.x, a.y, 6, 'work', '有人在敲打东西', a.id);
@@ -730,11 +936,19 @@ function runAction(world, a) {
             targetId: target.id,
             eventSeq: spoken.seq,
           });
-          recordBelief(world, target, `${a.name}说：「${say}」`, 'told', 0.6);
+          recordBelief(world, target, `${a.name}说：「${say}」`, 'told', 0.6, {
+            kind: 'talk',
+            subjectId: a.id,
+            predicate: 'said',
+            object: say,
+            place: placeName(world, a.x, a.y),
+            time: world.tick,
+          });
           remember(a, `你对${target.name}说：「${say}」`);
           remember(target, `${a.name}对你说：「${say}」`);
           emitSound(world, a.x, a.y, 5, 'talk', '有人在说话', a.id);
         }
+        retellBelief(world, a, target);
       }
       break;
     }
@@ -828,6 +1042,12 @@ function runAction(world, a) {
           object: target.id,
           damage: dmg,
           eventSeq: attacked.seq,
+        });
+        recordBelief(world, target, `${a.name}攻击了你。`, 'victim', 1, {
+          kind: 'fight',
+          subjectId: a.id,
+          predicate: 'hit',
+          targetId: target.id,
         });
         emitSound(world, a.x, a.y, 14, 'fight', '有人在打斗', a.id);
         remember(a, `你攻击了${target.name}。${act.reason ? `因为：${act.reason}` : ''}`);
@@ -998,12 +1218,11 @@ export function tick(world) {
 // 存档只包含世界与事件；密钥、模型配置、进行中的模型调用都不入档。
 
 function copyEvent(e) {
-  return {
-    ...e,
-    payload: e.payload
-      ? { ...e.payload, action: e.payload.action ? { ...e.payload.action } : e.payload.action }
-      : null,
-  };
+  if (!e.payload) return { ...e, payload: null };
+  const payload = { ...e.payload };
+  if (payload.action) payload.action = { ...payload.action };
+  if (payload.claim) payload.claim = copyClaim(payload.claim);
+  return { ...e, payload };
 }
 
 function copyAgentForStorage(a, deciding) {
@@ -1016,7 +1235,7 @@ function copyAgentForStorage(a, deciding) {
     learning: { ...a.learning },
     relationships: { ...a.relationships },
     memory: [...a.memory],
-    beliefs: (a.beliefs || []).map((b) => ({ ...b })),
+    beliefs: (a.beliefs || []).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
     trace: a.trace.map((t) => ({ ...t })),
     action: a.action ? { ...a.action } : null,
     queuedAction: a.queuedAction ? { ...a.queuedAction } : null,
@@ -1049,7 +1268,11 @@ export function serializeWorld(world) {
     sounds: world.sounds.map((s) => ({ ...s })),
     regrow: world.regrow.map((r) => ({ ...r })),
     nextWolfId: world.nextWolfId,
-    config: { paused: world.config.paused, speed: world.config.speed },
+    config: {
+      paused: world.config.paused,
+      speed: world.config.speed,
+      distortionChance: world.config.distortionChance ?? DEFAULT_DISTORTION,
+    },
     api: {},
     rngState: world.rng.getState(),
   };
@@ -1081,7 +1304,7 @@ export function loadWorld(data) {
     sounds: data.sounds.map((s) => ({ ...s })),
     regrow: data.regrow.map((r) => ({ ...r })),
     nextWolfId: data.nextWolfId,
-    config: { paused: false, speed: 1, llmAgents: 0, ...data.config },
+    config: { paused: false, speed: 1, llmAgents: 0, distortionChance: DEFAULT_DISTORTION, ...data.config },
     api: { provider: 'openai', base: '', key: '', model: '' },
     rng,
     pendingDecisions: [],
@@ -1130,6 +1353,7 @@ export function snapshot(world) {
       skills: { ...a.skills },
       knows: { ...a.knows },
       learning: { ...a.learning },
+      beliefs: a.beliefs.slice(-10).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
       memory: a.memory.slice(-20),
       letter: a.letter,
       useLLM: a.useLLM,
@@ -1139,6 +1363,7 @@ export function snapshot(world) {
     structures: world.structures.map((s) => ({ type: s.type, x: s.x, y: s.y, name: s.name })),
     wolves: world.wolves.map((w) => ({ id: w.id, x: w.x, y: w.y, hp: w.hp })),
     log: world.log.slice(-40),
+    facts: world.facts.slice(-20).map((f) => ({ ...f })),
     returnSummary: world.returnSummary || null,
     apiConfigured: !!world.api.key,
     llmAgents: world.config.llmAgents,
