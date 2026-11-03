@@ -273,6 +273,8 @@ export function createWorld(seed = 20261102) {
     remains: [],
     chronicle: [],
     nextChronicleId: 1,
+    institutions: [],
+    nextInstitutionId: 1,
     pendingTurnings: [],
     pendingDecisions: [],
     rng: mulberry32(seed ^ 0x9e3779b9),
@@ -327,6 +329,9 @@ export function createWorld(seed = 20261102) {
       identity: null,
       turningPoints: [],
       maxTurnings: 2 + Math.floor(buildRng() * 4),
+      hasProposedInstitution: false,
+      exiledUntil: 0,
+      lastRitualDay: 0,
       reputation: 0,
       relationships: {},
       memory: [],
@@ -465,6 +470,85 @@ const PLACES = ['水边', '营地', '树林', '废墟', '空地'];
 const BUILD_NAMES = { fire: '火堆', shelter: '窝棚', wall: '墙' };
 
 const HEIR_KINDS = { adopted: '养子', apprentice: '徒弟' };
+
+export const INSTITUTION_SCHEMAS = {
+  law: {
+    action: ['attack'],
+    place: ['camp', 'anywhere'],
+    subject: ['anyone', 'members', 'outsiders'],
+    weapon: ['any', 'armed'],
+    reputation: ['any', 'low'],
+    penalty: ['reputation', 'exile'],
+  },
+  doctrine: {
+    taboo: ['attack'],
+    ritual: ['campAtNight', 'buryDead'],
+    when: ['always', 'night'],
+  },
+  faction: {
+    name: 'text',
+    shared: ['yes', 'no'],
+    joinRequirement: ['trust', 'reputation'],
+  },
+};
+
+const INSTITUTION_LABEL = { law: '律法', doctrine: '教义', faction: '结社' };
+
+const TABOO_LABEL = { attack: '动手伤人' };
+const PLACE_LABEL = { camp: '营地', anywhere: '任何地方' };
+const SUBJECT_LABEL = { anyone: '所有人', members: '结社成员', outsiders: '结社外的人' };
+const WEAPON_LABEL = { any: '不论是否持械', armed: '持械者' };
+const REPUTATION_LABEL = { any: '不论声望', low: '声望低的人' };
+const PENALTY_LABEL = { reputation: '扣减声望', exile: '驱逐' };
+const RITUAL_LABEL = { campAtNight: '夜里回到营地', buryDead: '埋葬死者' };
+const WHEN_LABEL = { always: '任何时候', night: '夜里' };
+const JOIN_LABEL = { trust: '关系够近', reputation: '声望够高' };
+
+export const MIN_FACTION_RELATION = 15;
+
+function validateInstitution(kind, slots) {
+  const schema = INSTITUTION_SCHEMAS[kind];
+  if (!schema) return { ok: false, reasons: [`未知的制度类型：${kind}`] };
+  if (!slots || typeof slots !== 'object') return { ok: false, reasons: ['槽位必须是对象'] };
+
+  const reasons = [];
+  for (const key of Object.keys(slots)) {
+    if (!(key in schema)) reasons.push(`未知槽位：${key}`);
+  }
+
+  const normalized = {};
+  for (const [key, rule] of Object.entries(schema)) {
+    const value = slots[key];
+    if (value === undefined) {
+      reasons.push(`缺少槽位：${key}`);
+      continue;
+    }
+    if (rule === 'text') {
+      const text = String(value || '').trim().slice(0, 12);
+      if (!text) reasons.push(`${key} 不能为空`);
+      else normalized[key] = text;
+    } else if (!rule.includes(value)) {
+      reasons.push(`${key} 只能是：${rule.join(' / ')}`);
+    } else {
+      normalized[key] = value;
+    }
+  }
+
+  return reasons.length ? { ok: false, reasons } : { ok: true, slots: normalized };
+}
+
+export function describeInstitution(inst) {
+  if (inst.kind === 'law') {
+    const s = inst.slots;
+    return `禁止${TABOO_LABEL[s.action]}（${PLACE_LABEL[s.place]}；针对${SUBJECT_LABEL[s.subject]}；${WEAPON_LABEL[s.weapon]}；${REPUTATION_LABEL[s.reputation]}），违者${PENALTY_LABEL[s.penalty]}。`;
+  }
+  if (inst.kind === 'doctrine') {
+    const s = inst.slots;
+    return `禁忌：${TABOO_LABEL[s.taboo]}（${WHEN_LABEL[s.when]}）；仪式：${RITUAL_LABEL[s.ritual]}。`;
+  }
+  const s = inst.slots;
+  return `结社「${s.name}」，加入条件：${JOIN_LABEL[s.joinRequirement]}；共同财产：${s.shared === 'yes' ? '是' : '否'}。`;
+}
 
 export const TURNING_TRIGGERS = {
   killed: { labels: ['手上带血的人', '复仇者', '幸存者'] },
@@ -663,6 +747,9 @@ function describeAction(act) {
     case 'adopt': return '收养或收徒';
     case 'moveIn': return '搬进去或收下遗产';
     case 'bury': return '埋葬死者';
+    case 'propose': return '立下制度';
+    case 'join': return '加入结社';
+    case 'interpret': return '争夺制度的解释';
     case 'attack': return '攻击';
     case 'flee': return '逃跑';
     case 'rest': return '休息';
@@ -764,6 +851,7 @@ export function kill(world, a, cause, killerId = null) {
   }
 
   resolveInheritance(world, a);
+  updateFactionLeadership(world, a);
 }
 
 export function turningFallbackLabel(world, trigger) {
@@ -839,6 +927,274 @@ export function maybeTurn(world, agent, trigger, reason) {
     return null;
   }
   return applyTurning(world, agent, trigger, turningFallbackLabel(world, trigger), reason);
+}
+
+function factionOf(world, agentId) {
+  return (
+    world.institutions.find(
+      (inst) => inst.kind === 'faction' && inst.active && inst.members.includes(agentId)
+    ) || null
+  );
+}
+
+function sameFaction(world, aId, bId) {
+  if (!aId || !bId) return false;
+  const faction = factionOf(world, aId);
+  return !!faction && faction.slots.shared === 'yes' && faction.members.includes(bId);
+}
+
+function rejectInstitution(world, agent, kind, reasons) {
+  logEvent(
+    world,
+    'institution',
+    `${agent.name}的${INSTITUTION_LABEL[kind] || kind}提案被驳回：${reasons.join('；')}`,
+    agent.id,
+    { ok: false, reasons }
+  );
+  return { ok: false, reasons };
+}
+
+export function proposeInstitution(world, agent, kind, slots) {
+  if (!agent.alive) return { ok: false, reasons: ['死人不能立制度'] };
+  if ((agent.reputation || 0) < 10) {
+    return rejectInstitution(world, agent, kind, ['声望不足以立制度']);
+  }
+
+  const checked = validateInstitution(kind, slots);
+  if (!checked.ok) return rejectInstitution(world, agent, kind, checked.reasons);
+
+  if (
+    kind === 'faction' &&
+    world.institutions.some(
+      (inst) => inst.kind === 'faction' && inst.active && inst.leaderId === agent.id
+    )
+  ) {
+    return rejectInstitution(world, agent, kind, ['你已经是一个结社的领袖']);
+  }
+
+  const institution = {
+    id: `i${world.nextInstitutionId++}`,
+    kind,
+    proposerId: agent.id,
+    createdAt: world.tick,
+    slots: checked.slots,
+    active: true,
+    interpretations: {},
+  };
+  if (kind === 'faction') {
+    institution.leaderId = agent.id;
+    institution.members = [agent.id];
+  }
+  world.institutions.push(institution);
+  agent.hasProposedInstitution = true;
+
+  const description = describeInstitution(institution);
+  const event = logEvent(
+    world,
+    'institution',
+    `${agent.name}立下了${INSTITUTION_LABEL[kind]}：${description}`,
+    agent.id,
+    { kind, slots: { ...checked.slots } }
+  );
+  recordFact(world, {
+    type: 'institution',
+    subjectId: agent.id,
+    predicate: 'enacted',
+    object: kind,
+    slots: { ...checked.slots },
+    eventSeq: event.seq,
+  });
+  world.chronicle.push(
+    Object.freeze({
+      id: `c${world.nextChronicleId++}`,
+      t: world.tick,
+      day: world.day || 1,
+      kind: 'institution',
+      agentId: agent.id,
+      label: INSTITUTION_LABEL[kind],
+      reason: description,
+      x: agent.x,
+      y: agent.y,
+    })
+  );
+
+  if (kind === 'doctrine') {
+    for (const other of world.agents) {
+      if (other.alive) {
+        recordBelief(world, other, `你们的教义：${description}`, 'doctrine', 0.6);
+      }
+    }
+  }
+
+  return { ok: true, institution };
+}
+
+export function joinFaction(world, agent, factionId) {
+  const faction = world.institutions.find(
+    (inst) => inst.id === factionId && inst.kind === 'faction' && inst.active
+  );
+  if (!faction || faction.members.includes(agent.id)) return false;
+  const leader = world.agents.find((a) => a.id === faction.leaderId && a.alive);
+  if (!leader) return false;
+  const requirementMet =
+    faction.slots.joinRequirement === 'reputation'
+      ? (agent.reputation || 0) >= 10
+      : (agent.relationships[leader.id] || 0) >= MIN_FACTION_RELATION;
+  if (!requirementMet) return false;
+
+  faction.members.push(agent.id);
+  logEvent(world, 'institution', `${agent.name}加入了结社「${faction.slots.name}」。`, agent.id, {
+    factionId: faction.id,
+  });
+  recordFact(world, {
+    type: 'institution',
+    subjectId: agent.id,
+    predicate: 'joined',
+    object: faction.id,
+  });
+  recordBelief(world, agent, `你加入了${leader.name}的结社「${faction.slots.name}」。`, 'relation', 1);
+  return true;
+}
+
+function inCamp(world, x, y) {
+  return (
+    nearFire(world, x, y, 3) ||
+    world.structures.some(
+      (s) => s.type === 'camp' && Math.abs(s.x - x) + Math.abs(s.y - y) <= 3
+    )
+  );
+}
+
+export function interpretInstitution(world, agent, institutionId, reading) {
+  if (!agent.alive || (agent.reputation || 0) < 10) return false;
+  if (reading !== 'strict' && reading !== 'lenient') return false;
+  const institution = world.institutions.find((inst) => inst.id === institutionId && inst.active);
+  if (!institution) return false;
+
+  institution.interpretations[agent.id] = reading;
+  logEvent(
+    world,
+    'institution',
+    `${agent.name}声称${INSTITUTION_LABEL[institution.kind]}应当${reading === 'strict' ? '严格执行' : '宽缓处理'}。`,
+    agent.id,
+    { institutionId, reading }
+  );
+  recordFact(world, {
+    type: 'institution',
+    subjectId: agent.id,
+    predicate: 'interpreted',
+    object: institutionId,
+    reading,
+  });
+  return true;
+}
+
+function interpretationWeight(world, agent) {
+  const faction = factionOf(world, agent.id);
+  return (
+    (agent.reputation || 0) +
+    (faction?.leaderId === agent.id ? 10 : 0) +
+    (faction ? faction.members.length * 2 : 0)
+  );
+}
+
+function currentReading(world, institution) {
+  const living = Object.entries(institution.interpretations)
+    .map(([id, reading]) => ({ agent: world.agents.find((a) => a.id === id && a.alive), reading }))
+    .filter((entry) => entry.agent)
+    .sort((a, b) => interpretationWeight(world, b.agent) - interpretationWeight(world, a.agent));
+  return living[0]?.reading || 'strict';
+}
+
+function enforceAttack(world, actor, target) {
+  const sharesFaction = target ? sameFaction(world, actor.id, target.id) : false;
+  const laws = world.institutions.filter((inst) => {
+    if (!inst.active || inst.kind !== 'law' || inst.slots.action !== 'attack') return false;
+    if (inst.slots.place !== 'anywhere' && !inCamp(world, actor.x, actor.y)) return false;
+    if (inst.slots.subject === 'members' && !sharesFaction) return false;
+    if (inst.slots.subject === 'outsiders' && sharesFaction) return false;
+    if (inst.slots.weapon === 'armed' && !(actor.inventory.weapon > 0)) return false;
+    if (inst.slots.reputation === 'low' && !((actor.reputation || 0) < 0)) return false;
+    return true;
+  });
+  const doctrines = world.institutions.filter(
+    (inst) =>
+      inst.active &&
+      inst.kind === 'doctrine' &&
+      inst.slots.taboo === 'attack' &&
+      (inst.slots.when !== 'night' || world.isNight)
+  );
+
+  let punished = false;
+  for (const law of laws) {
+    const reading = currentReading(world, law);
+    const base = law.slots.penalty === 'exile' ? 20 : 10;
+    const amount = reading === 'lenient' ? Math.ceil(base / 2) : base;
+    actor.reputation -= amount;
+    if (law.slots.penalty === 'exile' && reading === 'strict') {
+      actor.exiledUntil = world.tick + TICKS_PER_DAY;
+    }
+    logEvent(world, 'punish', `${actor.name}违反了律法：${describeInstitution(law)}`, actor.id, {
+      institutionId: law.id,
+      action: 'attack',
+    });
+    recordFact(world, {
+      type: 'punish',
+      subjectId: actor.id,
+      predicate: 'broke',
+      object: law.id,
+      action: 'attack',
+    });
+    punished = true;
+  }
+  for (const doctrine of doctrines) {
+    actor.reputation -= currentReading(world, doctrine) === 'lenient' ? 2 : 5;
+    logEvent(world, 'punish', `${actor.name}违反了教义禁忌：${TABOO_LABEL.attack}。`, actor.id, {
+      institutionId: doctrine.id,
+      action: 'attack',
+    });
+    recordFact(world, {
+      type: 'punish',
+      subjectId: actor.id,
+      predicate: 'broke',
+      object: doctrine.id,
+      action: 'attack',
+    });
+    punished = true;
+  }
+
+  if (punished) {
+    for (const other of world.agents) {
+      if (
+        other.alive &&
+        other.id !== actor.id &&
+        Math.abs(other.x - actor.x) + Math.abs(other.y - actor.y) <= 5
+      ) {
+        recordBelief(world, other, `${actor.name}${target ? `打了${target.name}，` : ''}触犯了制度。`, 'witness', 0.85);
+      }
+    }
+    remember(actor, '你触犯了这里的制度。');
+  }
+  return punished;
+}
+
+function updateFactionLeadership(world, dead) {
+  for (const faction of world.institutions) {
+    if (faction.kind !== 'faction' || !faction.active || faction.leaderId !== dead.id) continue;
+    faction.members = faction.members.filter((id) =>
+      world.agents.some((agent) => agent.id === id && agent.alive)
+    );
+    if (!faction.members.length) {
+      faction.active = false;
+      logEvent(world, 'institution', `结社「${faction.slots.name}」散了。`, dead.id);
+      continue;
+    }
+    const next = faction.members
+      .map((id) => world.agents.find((agent) => agent.id === id))
+      .sort((a, b) => b.reputation - a.reputation)[0];
+    faction.leaderId = next.id;
+    logEvent(world, 'institution', `${next.name}接手了结社「${faction.slots.name}」。`, next.id);
+  }
 }
 
 function transferItems(items, inventory) {
@@ -985,6 +1341,17 @@ function stepAgent(world, a) {
 
   correctBeliefs(world, a);
   learnByProximity(world, a);
+
+  if (world.isNight && nearFire(world, a.x, a.y, 3) && a.lastRitualDay !== (world.day || 1)) {
+    const hasRitual = world.institutions.some(
+      (inst) => inst.active && inst.kind === 'doctrine' && inst.slots.ritual === 'campAtNight'
+    );
+    if (hasRitual) {
+      a.lastRitualDay = world.day || 1;
+      a.reputation += 2;
+      remember(a, '你按教义回到了火边。');
+    }
+  }
 }
 
 function endAction(world, a, cooldown = 2) {
@@ -1004,6 +1371,12 @@ function runAction(world, a) {
       const nx = a.x + dx;
       const ny = a.y + dy;
       const occupied = world.agents.some((o) => o.alive && o.id !== a.id && o.x === nx && o.y === ny);
+      if (a.exiledUntil > world.tick && inCamp(world, nx, ny)) {
+        a.lastAction = '你被驱逐，不能回到营地';
+        recordTrace(world, a, a.lastAction);
+        endAction(world, a, 2);
+        return;
+      }
       if (isWalkable(world, nx, ny) && !occupied) {
         a.x = nx;
         a.y = ny;
@@ -1351,6 +1724,24 @@ function runAction(world, a) {
       break;
     }
 
+    case 'propose': {
+      if (act.remaining > 0) break;
+      proposeInstitution(world, a, act.kind, act.slots || {});
+      break;
+    }
+
+    case 'join': {
+      if (act.remaining > 0) break;
+      joinFaction(world, a, act.faction);
+      break;
+    }
+
+    case 'interpret': {
+      if (act.remaining > 0) break;
+      interpretInstitution(world, a, act.institution, act.reading);
+      break;
+    }
+
     case 'bury': {
       if (act.remaining > 0) break;
       const grave = world.structures.find(
@@ -1382,6 +1773,14 @@ function runAction(world, a) {
         y: grave.y,
       });
       remember(a, `你埋葬了${grave.name}。`);
+      if (
+        world.institutions.some(
+          (inst) => inst.active && inst.kind === 'doctrine' && inst.slots.ritual === 'buryDead'
+        )
+      ) {
+        a.reputation += 3;
+        remember(a, '你按教义埋葬了死者。');
+      }
       if (kin) maybeTurn(world, a, 'kin_died', `你亲手埋葬了${grave.name}。`);
       break;
     }
@@ -1479,6 +1878,7 @@ function runAction(world, a) {
         }
         const dmg = Math.max(2, atk - def);
         damage(world, target, dmg, a);
+        enforceAttack(world, a, target);
         growSkill(a, 'fight', 0.05);
         a.reputation -= 2;
         target.relationships[a.id] = (target.relationships[a.id] || 0) - 25;
@@ -1529,7 +1929,9 @@ function runAction(world, a) {
     case 'rest': {
       a.energy = Math.min(100, a.energy + 0.4);
       const shelter = structureAt(world, a.x, a.y);
-      const mayUse = shelter?.type === 'shelter' && (!shelter.ownerId || shelter.ownerId === a.id);
+      const mayUse =
+        shelter?.type === 'shelter' &&
+        (!shelter.ownerId || shelter.ownerId === a.id || sameFaction(world, a.id, shelter.ownerId));
       if (mayUse) a.energy = Math.min(100, a.energy + 0.2);
       break;
     }
@@ -1714,6 +2116,13 @@ export function serializeWorld(world) {
     remains: world.remains.map(copyRemains),
     chronicle: world.chronicle.map((c) => ({ ...c })),
     nextChronicleId: world.nextChronicleId,
+    institutions: world.institutions.map((inst) => ({
+      ...inst,
+      slots: { ...inst.slots },
+      interpretations: { ...inst.interpretations },
+      ...(inst.members ? { members: [...inst.members] } : {}),
+    })),
+    nextInstitutionId: world.nextInstitutionId,
     log: world.log.map(copyEvent),
     eventLog: world.eventLog.map(copyEvent),
     facts: world.facts.map((f) => ({ ...f })),
@@ -1752,6 +2161,13 @@ export function loadWorld(data) {
     remains: (data.remains || []).map(copyRemains),
     chronicle: (data.chronicle || []).map((c) => Object.freeze({ ...c })),
     nextChronicleId: data.nextChronicleId || 1,
+    institutions: (data.institutions || []).map((inst) => ({
+      ...inst,
+      slots: { ...inst.slots },
+      interpretations: { ...inst.interpretations },
+      ...(inst.members ? { members: [...inst.members] } : {}),
+    })),
+    nextInstitutionId: data.nextInstitutionId || 1,
     pendingTurnings: [],
     log: data.log.map(copyEvent),
     eventLog: data.eventLog.map(copyEvent),
@@ -1834,6 +2250,14 @@ export function snapshot(world) {
     })),
     remains: world.remains.slice(-10).map(copyRemains),
     chronicle: world.chronicle.slice(-20).map((c) => ({ ...c })),
+    institutions: world.institutions.slice(-10).map((inst) => ({
+      id: inst.id,
+      kind: inst.kind,
+      active: inst.active,
+      description: describeInstitution(inst),
+      leaderId: inst.leaderId || null,
+      members: inst.members ? [...inst.members] : [],
+    })),
     wolves: world.wolves.map((w) => ({ id: w.id, x: w.x, y: w.y, hp: w.hp })),
     log: world.log.slice(-40),
     facts: world.facts.slice(-20).map((f) => ({ ...f })),

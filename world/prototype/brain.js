@@ -14,6 +14,8 @@ import {
   LANGUAGE_LABEL,
   TURNING_TRIGGERS,
   sharedLanguage,
+  describeInstitution,
+  MIN_FACTION_RELATION,
   resourceNear,
   isWalkable,
   logDecision,
@@ -175,8 +177,8 @@ export function mockDecide(world, a) {
     }
   }
 
-  // 夜：回营地
-  if (world.isNight) {
+  // 夜：回营地；被驱逐的人进不了营地。
+  if (world.isNight && !(a.exiledUntil > world.tick)) {
     const camp = nearestStructure(world, a, 'camp', 40);
     if (camp) {
       const d = Math.abs(camp.x - a.x) + Math.abs(camp.y - a.y);
@@ -259,6 +261,69 @@ export function mockDecide(world, a) {
   }
 
   // 没有继承人时，遇到足够亲近的人就收养或收徒。
+  // 声望够高的人会立制度；有结社就去加入。
+  if (!a.hasProposedInstitution && (a.reputation || 0) >= 10 && world.rng() < 0.02) {
+    const has = (kind) => world.institutions.some((inst) => inst.active && inst.kind === kind);
+    if (!has('law')) {
+      return {
+        type: 'propose',
+        kind: 'law',
+        slots: {
+          action: 'attack',
+          place: 'camp',
+          subject: 'anyone',
+          weapon: 'any',
+          reputation: 'any',
+          penalty: 'reputation',
+        },
+        remaining: 1,
+      };
+    }
+    if (!has('doctrine')) {
+      return {
+        type: 'propose',
+        kind: 'doctrine',
+        slots: { taboo: 'attack', ritual: 'buryDead', when: 'always' },
+        remaining: 1,
+      };
+    }
+    if (!has('faction')) {
+      return {
+        type: 'propose',
+        kind: 'faction',
+        slots: { name: `${a.name}的结社`, shared: 'yes', joinRequirement: 'trust' },
+        remaining: 1,
+      };
+    }
+  }
+
+  if ((a.reputation || 0) >= 10 && world.institutions.length && world.rng() < 0.01) {
+    const institution = world.institutions.find(
+      (inst) => inst.active && !inst.interpretations[a.id]
+    );
+    if (institution) {
+      return {
+        type: 'interpret',
+        institution: institution.id,
+        reading: world.rng() < 0.5 ? 'strict' : 'lenient',
+        remaining: 1,
+      };
+    }
+  }
+
+  if (world.rng() < 0.02) {
+    const faction = world.institutions.find(
+      (inst) =>
+        inst.kind === 'faction' &&
+        inst.active &&
+        !inst.members.includes(a.id) &&
+        (inst.slots.joinRequirement === 'reputation'
+          ? (a.reputation || 0) >= 10
+          : (a.relationships[inst.leaderId] || 0) >= MIN_FACTION_RELATION)
+    );
+    if (faction) return { type: 'join', faction: faction.id, remaining: 1 };
+  }
+
   const adoptChance = Math.max(0, 0.05 + (traits.talk || 0) * 0.02);
   if (!a.heirId && adoptChance > 0 && world.rng() < adoptChance) {
     const close = nearestAgent(world, a, 2, (o) => (a.relationships[o.id] || 0) >= 15);
@@ -389,6 +454,7 @@ function buildPrompt(world, a) {
 你的位置：(${a.x},${a.y})，可走的方向：${canWalk.map((d) => DIR_NAMES[d]).join('、') || '无'}
 状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}
 你说的语言：${LANGUAGE_LABEL[a.nativeLanguage]}；你会的语言：${Object.keys(a.languages).map((l) => LANGUAGE_LABEL[l]).join('、')}
+${a.exiledUntil > world.tick ? '你被驱逐了，不能回到营地。' : ''}
 ${a.mentorId ? `收养你的人：${world.agents.find((x) => x.id === a.mentorId)?.name || '某个人'}` : ''}
 ${a.inheritedObsession ? `你接过了${a.inheritedFrom}没做完的事：${a.inheritedObsession}` : ''}
 ${a.identity ? `你现在的身份：${a.identity}` : ''}
@@ -401,6 +467,7 @@ ${Object.keys(a.learning || {}).length ? `你正在学：${Object.entries(a.lear
 你看见的人：${near.seen}
 你看见的建筑：${near.structs}
 无人继承的遗产：${near.remains}
+现有制度：${world.institutions.filter((i) => i.active).map((i) => `${i.id} ${describeInstitution(i)}`).join('；') || '没有'}
 ${near.wolves ? `你看见的野兽：${near.wolves}` : ''}
 你听见：${near.heard}
 身边的资源：${near.res}
@@ -409,7 +476,7 @@ ${near.water}
 你相信最近发生的事：${a.beliefs.slice(-3).map((b) => b.proposition).join('；') || '没有'}
 ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 
-规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。站在坟旁边可以埋葬死者；埋葬自己收养或收徒的人，会改变你的一生。不同语言的人听不懂彼此说的话；你可以教对方你的语言，也可能在长期接触中慢慢学会对方的语言。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
+规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。站在坟旁边可以埋葬死者；埋葬自己收养或收徒的人，会改变你的一生。不同语言的人听不懂彼此说的话；你可以教对方你的语言，也可能在长期接触中慢慢学会对方的语言。立制度必须填满这些槽位：律法 {action:"attack", place:"camp"或"anywhere", subject:"anyone"或"members"或"outsiders", weapon:"any"或"armed", reputation:"any"或"low", penalty:"reputation"或"exile"}；教义 {taboo:"attack", ritual:"campAtNight"或"buryDead", when:"always"或"night"}；结社 {name:"不超过12字", shared:"yes"或"no", joinRequirement:"trust"或"reputation"}。声望不到 10 不能立制度。声望够高的人也可以争夺制度的解释权：strict 严格执行，lenient 宽缓处理；活着的解释者里声望最高的那个决定这条制度怎么执行。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
 
 选择你接下来的行动。只输出一个 JSON：
 {"action":"move","dir":"N|S|E|W","steps":1到8}
@@ -424,6 +491,9 @@ ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 {"action":"adopt","target":"名字","kind":"adopted|apprentice","reason":"为什么要把身后事交给他"}
 {"action":"moveIn","reason":"为什么要搬进去"}
 {"action":"bury","reason":"为什么要埋葬"}
+{"action":"propose","kind":"law|doctrine|faction","slots":{},"reason":"为什么要立"}
+{"action":"join","faction":"结社 id","reason":"为什么要加入"}
+{"action":"interpret","institution":"制度 id","reading":"strict|lenient","reason":"为什么要这样解释"}
 {"action":"attack","target":"名字或野兽","reason":"为什么动手"}
 {"action":"flee","reason":"为什么要逃"}
 {"action":"rest"}
@@ -449,7 +519,7 @@ function normalize(world, a, raw) {
   if (!obj || typeof obj !== 'object') return null;
 
   const whyText = String(obj.reason || obj.why || '').slice(0, 60);
-  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'adopt', 'moveIn', 'bury', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
+  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'adopt', 'moveIn', 'bury', 'propose', 'join', 'interpret', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
   const action = ACTIONS.includes(obj.action) ? obj.action : ACTIONS.includes(obj.type) ? obj.type : null;
 
   if (action === 'move') {
@@ -514,6 +584,23 @@ function normalize(world, a, raw) {
   }
   if (action === 'moveIn') return { type: 'moveIn', reason: whyText, remaining: 1 };
   if (action === 'bury') return { type: 'bury', reason: whyText, remaining: 1 };
+  if (action === 'propose') {
+    const kind = String(obj.kind || obj.institution || '').trim();
+    if (!['law', 'doctrine', 'faction'].includes(kind)) return null;
+    const slots = obj.slots && typeof obj.slots === 'object' ? obj.slots : {};
+    return { type: 'propose', kind, slots, reason: whyText, remaining: 1 };
+  }
+  if (action === 'join') {
+    const faction = String(obj.faction || obj.id || '').trim();
+    if (!faction) return null;
+    return { type: 'join', faction, reason: whyText, remaining: 1 };
+  }
+  if (action === 'interpret') {
+    const institution = String(obj.institution || obj.id || '').trim();
+    const reading = String(obj.reading || '').trim();
+    if (!institution || !['strict', 'lenient'].includes(reading)) return null;
+    return { type: 'interpret', institution, reading, reason: whyText, remaining: 1 };
+  }
   if (action === 'attack') {
     const t = String(obj.target ?? obj.to ?? obj.name ?? '');
     const reason = String(obj.reason || obj.why || '').slice(0, 60);
