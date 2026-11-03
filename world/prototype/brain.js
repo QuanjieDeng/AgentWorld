@@ -16,6 +16,8 @@ import {
   sharedLanguage,
   describeInstitution,
   MIN_FACTION_RELATION,
+  DEFAULT_REMEMBRANCE,
+  LOW_REMEMBRANCE,
   resourceNear,
   isWalkable,
   logDecision,
@@ -206,6 +208,17 @@ export function mockDecide(world, a) {
   }
 
   if (a.energy < 22) return { type: 'rest', remaining: 30 };
+
+  // 快要被忘记了，就去找人说话：被惦记才清醒。
+  if ((a.remembrance ?? DEFAULT_REMEMBRANCE) < LOW_REMEMBRANCE) {
+    const other = nearestAgent(world, a, 3);
+    if (other) {
+      if (Math.abs(other.x - a.x) + Math.abs(other.y - a.y) <= 1) {
+        return { type: 'talk', target: other.id, say: mockSay(world, a, other), remaining: 2 };
+      }
+      return moveToward(a, other.x, other.y);
+    }
+  }
 
   // 亲手埋葬自己的继承人/收养人，是这一生少数几个真正的转折。
   const kinGrave = world.structures.find((s) => {
@@ -452,7 +465,7 @@ function buildPrompt(world, a) {
 
   const user = `时间：第${world.day}天 ${world.clock}（${world.isNight ? '夜' : '昼'}）
 你的位置：(${a.x},${a.y})，可走的方向：${canWalk.map((d) => DIR_NAMES[d]).join('、') || '无'}
-状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}
+状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}，被记住${Math.round(a.remembrance ?? DEFAULT_REMEMBRANCE)}/100
 你说的语言：${LANGUAGE_LABEL[a.nativeLanguage]}；你会的语言：${Object.keys(a.languages).map((l) => LANGUAGE_LABEL[l]).join('、')}
 ${a.exiledUntil > world.tick ? '你被驱逐了，不能回到营地。' : ''}
 ${a.mentorId ? `收养你的人：${world.agents.find((x) => x.id === a.mentorId)?.name || '某个人'}` : ''}

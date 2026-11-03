@@ -14,6 +14,7 @@ const KEY_EVENT_TYPES = new Set([
   'turning',
   'institution',
   'punish',
+  'fade',
 ]);
 
 export function stepWorld(world, ticks) {

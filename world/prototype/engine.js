@@ -278,7 +278,13 @@ export function createWorld(seed = 20261102) {
     pendingTurnings: [],
     pendingDecisions: [],
     rng: mulberry32(seed ^ 0x9e3779b9),
-    config: { paused: false, speed: 1, llmAgents: 0, distortionChance: DEFAULT_DISTORTION },
+    config: {
+      paused: false,
+      speed: 1,
+      llmAgents: 0,
+      distortionChance: DEFAULT_DISTORTION,
+      remembranceDecay: DEFAULT_REMEMBRANCE_DECAY,
+    },
     api: { provider: 'openai', base: '', key: '', model: '' },
     inflight: 0,
     nextWolfId: 1,
@@ -332,6 +338,10 @@ export function createWorld(seed = 20261102) {
       hasProposedInstitution: false,
       exiledUntil: 0,
       lastRitualDay: 0,
+      presence: 'offline',
+      remembrance: DEFAULT_REMEMBRANCE,
+      fadeStage: 0,
+      faded: false,
       reputation: 0,
       relationships: {},
       memory: [],
@@ -420,6 +430,7 @@ export function deliverLetter(world, agent, text) {
   }
   agent.letter = text;
   remember(agent, `你听见一个声音说：「${text}」`);
+  rememberAgent(world, agent.id, MENTION_GAIN.letter);
   logEvent(world, 'letter', `一个声音在${agent.name}耳边说：「${text}」`, agent.id, {
     text,
     heard: true,
@@ -440,6 +451,16 @@ export function recordFact(world, fact) {
 
 function copyClaim(claim) {
   return claim ? { ...claim } : null;
+}
+
+export function rememberAgent(world, agentId, amount) {
+  const agent = world.agents.find((a) => a.id === agentId);
+  if (!agent) return;
+  agent.remembrance = Math.min(
+    MAX_REMEMBRANCE,
+    Math.max(0, (agent.remembrance ?? DEFAULT_REMEMBRANCE) + amount)
+  );
+  agent.fadeStage = 0;
 }
 
 export function recordBelief(world, agent, proposition, source, confidence = 0.8, claim = null) {
@@ -464,6 +485,25 @@ const PREDICATE_LADDER = {
 };
 
 const DEFAULT_DISTORTION = 0.55;
+
+export const DEFAULT_REMEMBRANCE = 20;
+const MAX_REMEMBRANCE = 100;
+const DEFAULT_REMEMBRANCE_DECAY = 5;
+export const LOW_REMEMBRANCE = 10;
+
+export const MENTION_GAIN = Object.freeze({
+  retell: 6,
+  burial: 12,
+  bury: 3,
+  talk: 1,
+  teach: 2,
+  adopt: 2,
+  inherit: 2,
+  turning: 4,
+  letter: 10,
+  institution: 2,
+  interpret: 1,
+});
 
 const PLACES = ['水边', '营地', '树林', '废墟', '空地'];
 
@@ -672,6 +712,7 @@ function retellBelief(world, speaker, listener) {
   });
   const belief = recordBelief(world, listener, renderClaim(world, claim), 'hearsay', confidence, claim);
   belief.sourceAgentId = speaker.id;
+  rememberAgent(world, claim.subjectId, MENTION_GAIN.retell);
   return belief;
 }
 
@@ -885,6 +926,7 @@ export function applyTurning(world, agent, trigger, label, reason) {
   agent.turningPoints.push(turning);
   agent.identity = chosen;
   agent.reputation += 5;
+  rememberAgent(world, agent.id, MENTION_GAIN.turning);
 
   const event = logEvent(world, 'turning', `${agent.name}脱变成了${chosen}。${reason}`, agent.id, {
     trigger,
@@ -987,6 +1029,7 @@ export function proposeInstitution(world, agent, kind, slots) {
   }
   world.institutions.push(institution);
   agent.hasProposedInstitution = true;
+  rememberAgent(world, agent.id, MENTION_GAIN.institution);
 
   const description = describeInstitution(institution);
   const event = logEvent(
@@ -1043,6 +1086,7 @@ export function joinFaction(world, agent, factionId) {
   if (!requirementMet) return false;
 
   faction.members.push(agent.id);
+  rememberAgent(world, agent.id, MENTION_GAIN.institution);
   logEvent(world, 'institution', `${agent.name}加入了结社「${faction.slots.name}」。`, agent.id, {
     factionId: faction.id,
   });
@@ -1072,6 +1116,7 @@ export function interpretInstitution(world, agent, institutionId, reading) {
   if (!institution) return false;
 
   institution.interpretations[agent.id] = reading;
+  rememberAgent(world, agent.id, MENTION_GAIN.interpret);
   logEvent(
     world,
     'institution',
@@ -1255,6 +1300,7 @@ function resolveInheritance(world, dead) {
       eventSeq: event.seq,
     });
     remember(heir, `你继承了${dead.name}留下的一切。`);
+    rememberAgent(world, heir.id, MENTION_GAIN.inherit);
     return;
   }
 
@@ -1266,6 +1312,38 @@ function resolveInheritance(world, dead) {
     if (structure.ownerId === dead.id) structure.ownerId = null;
   }
   logEvent(world, 'inherit', `${dead.name}没有继承人，留下了一座空宅。`, dead.id);
+}
+
+function fadeAgent(world, agent) {
+  agent.faded = true;
+  agent.alive = false;
+  agent.hp = 0;
+  agent.action = null;
+  agent.queuedAction = null;
+  for (const structure of world.structures) {
+    if (structure.ownerId === agent.id) structure.ownerId = null;
+  }
+  logEvent(world, 'fade', `${agent.name}被世界抹去了。`, agent.id);
+  recordFact(world, { type: 'fade', subjectId: agent.id, predicate: 'faded' });
+  updateFactionLeadership(world, agent);
+}
+
+export function decayRemembrance(world) {
+  const decay = world.config.remembranceDecay ?? DEFAULT_REMEMBRANCE_DECAY;
+  for (const agent of world.agents) {
+    if (!agent.alive || agent.presence === 'online') continue;
+    agent.remembrance = Math.max(
+      0,
+      (agent.remembrance ?? DEFAULT_REMEMBRANCE) - decay
+    );
+    if (agent.remembrance === 0) {
+      agent.fadeStage = (agent.fadeStage || 0) + 1;
+      logEvent(world, 'fade', `${agent.name}正在被遗忘（${agent.fadeStage}/3）。`, agent.id);
+      if (agent.fadeStage >= 3) fadeAgent(world, agent);
+    } else if (agent.fadeStage) {
+      agent.fadeStage = 0;
+    }
+  }
 }
 
 function damage(world, target, amount, by) {
@@ -1587,6 +1665,7 @@ function runAction(world, a) {
         a.relationships[target.id] = (a.relationships[target.id] || 0) + delta;
         target.relationships[a.id] = (target.relationships[a.id] || 0) + delta;
         growSkill(a, 'talk', 0.04);
+        rememberAgent(world, a.id, MENTION_GAIN.talk);
 
         if (say) {
           const spoken = logEvent(world, 'talk', `${a.name}对${target.name}说：「${say}」`, a.id, {
@@ -1683,6 +1762,8 @@ function runAction(world, a) {
       if (taught) {
         a.relationships[target.id] = (a.relationships[target.id] || 0) + 4;
         target.relationships[a.id] = (target.relationships[a.id] || 0) + 4;
+        rememberAgent(world, a.id, MENTION_GAIN.teach);
+        rememberAgent(world, target.id, MENTION_GAIN.teach);
       }
       break;
     }
@@ -1721,6 +1802,8 @@ function runAction(world, a) {
       });
       remember(a, `你${label}：${target.name}。他会继承你留下的一切。`);
       remember(target, `${a.name}${label}你。`);
+      rememberAgent(world, a.id, MENTION_GAIN.adopt);
+      rememberAgent(world, target.id, MENTION_GAIN.adopt);
       break;
     }
 
@@ -1773,6 +1856,8 @@ function runAction(world, a) {
         y: grave.y,
       });
       remember(a, `你埋葬了${grave.name}。`);
+      if (grave.agentId) rememberAgent(world, grave.agentId, MENTION_GAIN.burial);
+      rememberAgent(world, a.id, MENTION_GAIN.bury);
       if (
         world.institutions.some(
           (inst) => inst.active && inst.kind === 'doctrine' && inst.slots.ritual === 'buryDead'
@@ -2028,6 +2113,8 @@ export function tick(world) {
   world.clock = `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
   world.isNight = minute < 360 || minute >= 1080;
 
+  if (world.tick % TICKS_PER_DAY === 0) decayRemembrance(world);
+
   if (world.isNight && !world.nightActive) {
     world.nightActive = true;
     spawnWolves(world);
@@ -2137,6 +2224,7 @@ export function serializeWorld(world) {
       paused: world.config.paused,
       speed: world.config.speed,
       distortionChance: world.config.distortionChance ?? DEFAULT_DISTORTION,
+      remembranceDecay: world.config.remembranceDecay ?? DEFAULT_REMEMBRANCE_DECAY,
     },
     api: {},
     rngState: world.rng.getState(),
@@ -2180,7 +2268,14 @@ export function loadWorld(data) {
     sounds: data.sounds.map((s) => ({ ...s })),
     regrow: data.regrow.map((r) => ({ ...r })),
     nextWolfId: data.nextWolfId,
-    config: { paused: false, speed: 1, llmAgents: 0, distortionChance: DEFAULT_DISTORTION, ...data.config },
+    config: {
+      paused: false,
+      speed: 1,
+      llmAgents: 0,
+      distortionChance: DEFAULT_DISTORTION,
+      remembranceDecay: DEFAULT_REMEMBRANCE_DECAY,
+      ...data.config,
+    },
     api: { provider: 'openai', base: '', key: '', model: '' },
     rng,
     pendingDecisions: [],
@@ -2231,6 +2326,10 @@ export function snapshot(world) {
       learning: { ...a.learning },
       nativeLanguage: a.nativeLanguage,
       languages: { ...a.languages },
+      presence: a.presence,
+      remembrance: Math.round(a.remembrance ?? DEFAULT_REMEMBRANCE),
+      fadeStage: a.fadeStage || 0,
+      faded: !!a.faded,
       identity: a.identity,
       turningPoints: a.turningPoints.slice(-5).map((t) => ({ ...t })),
       beliefs: a.beliefs.slice(-10).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
