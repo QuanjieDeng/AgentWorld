@@ -222,6 +222,7 @@ export function createWorld(seed = 20261102) {
     replay: null,
     sounds: [],
     regrow: [],
+    remains: [],
     pendingDecisions: [],
     rng: mulberry32(seed ^ 0x9e3779b9),
     config: { paused: false, speed: 1, llmAgents: 0, distortionChance: DEFAULT_DISTORTION },
@@ -256,6 +257,11 @@ export function createWorld(seed = 20261102) {
       skills,
       knows,
       learning: {},
+      heirId: null,
+      heirKind: null,
+      mentorId: null,
+      inheritedObsession: null,
+      inheritedFrom: null,
       reputation: 0,
       relationships: {},
       memory: [],
@@ -332,6 +338,25 @@ export function remember(agent, text) {
   if (agent.memory.length > 20) agent.memory.shift();
 }
 
+export function deliverLetter(world, agent, text) {
+  const inChain = !!(agent.mentorId || agent.heirId);
+  if (!inChain) {
+    logEvent(world, 'letter', `${agent.name}听见了一个声音，但没有听懂。`, agent.id, {
+      text,
+      heard: false,
+    });
+    remember(agent, '你听见了一个声音，但没有听懂。');
+    return false;
+  }
+  agent.letter = text;
+  remember(agent, `你听见一个声音说：「${text}」`);
+  logEvent(world, 'letter', `一个声音在${agent.name}耳边说：「${text}」`, agent.id, {
+    text,
+    heard: true,
+  });
+  return true;
+}
+
 export function recordFact(world, fact) {
   const entry = {
     id: 'f' + world.nextFactId++,
@@ -373,6 +398,8 @@ const DEFAULT_DISTORTION = 0.55;
 const PLACES = ['水边', '营地', '树林', '废墟', '空地'];
 
 const BUILD_NAMES = { fire: '火堆', shelter: '窝棚', wall: '墙' };
+
+const HEIR_KINDS = { adopted: '养子', apprentice: '徒弟' };
 
 function nameOf(world, id) {
   return world.agents.find((a) => a.id === id)?.name || '某个人';
@@ -557,6 +584,8 @@ function describeAction(act) {
     case 'build': return { fire: '生火', shelter: '搭窝棚', wall: '砌墙' }[act.build] || '建造';
     case 'talk': return '和人说话';
     case 'teach': return '教人东西';
+    case 'adopt': return '收养或收徒';
+    case 'moveIn': return '搬进去或收下遗产';
     case 'attack': return '攻击';
     case 'flee': return '逃跑';
     case 'rest': return '休息';
@@ -640,6 +669,78 @@ export function kill(world, a, cause, killerId = null) {
       recordBelief(world, other, renderClaim(world, claim), 'witness', 0.9, claim);
     }
   }
+  resolveInheritance(world, a);
+}
+
+function transferItems(items, inventory) {
+  inventory.food += items.food;
+  inventory.wood += items.wood;
+  inventory.stone += items.stone;
+  inventory.weapon = Math.max(inventory.weapon, items.weapon);
+}
+
+function copyRemains(remains) {
+  return { ...remains, items: { ...remains.items } };
+}
+
+function resolveInheritance(world, dead) {
+  const heir = dead.heirId ? world.agents.find((a) => a.id === dead.heirId && a.alive) : null;
+
+  if (heir) {
+    transferItems(dead.inventory, heir.inventory);
+    for (const skill of SKILL_KEYS) {
+      const diff = (dead.skills[skill] || 0) - (heir.skills[skill] || 0);
+      if (diff > 0) growSkill(heir, skill, diff * 0.5);
+    }
+    // 只有徒弟继承手艺里的“怎么做”；养子得到的是家当，不是知识。
+    if (dead.heirKind === 'apprentice') {
+      for (const key of KNOWLEDGE_KEYS) {
+        if (dead.knows[key]) heir.knows[key] = true;
+      }
+    }
+    for (const belief of dead.beliefs.slice(-20)) {
+      recordBelief(
+        world,
+        heir,
+        belief.proposition,
+        'inherited',
+        Math.max(0.05, belief.confidence * 0.6),
+        belief.claim
+      );
+    }
+    heir.inheritedObsession = dead.tags.obsession;
+    heir.inheritedFrom = dead.name;
+    recordBelief(world, heir, `${dead.name}没能做完的事：${dead.tags.obsession}`, 'inherited', 0.9);
+    for (const structure of world.structures) {
+      if (structure.ownerId === dead.id) structure.ownerId = heir.id;
+    }
+    const title = HEIR_KINDS[dead.heirKind] || '继承人';
+    const event = logEvent(
+      world,
+      'inherit',
+      `${dead.name}把留下来的一切交给了${title}${heir.name}。`,
+      dead.id,
+      { heirId: heir.id }
+    );
+    recordFact(world, {
+      type: 'inherit',
+      subjectId: dead.id,
+      predicate: 'inheritedBy',
+      object: heir.id,
+      eventSeq: event.seq,
+    });
+    remember(heir, `你继承了${dead.name}留下的一切。`);
+    return;
+  }
+
+  const items = dead.inventory;
+  if (items.food || items.wood || items.stone || items.weapon) {
+    world.remains.push({ x: dead.x, y: dead.y, name: dead.name, items: { ...items } });
+  }
+  for (const structure of world.structures) {
+    if (structure.ownerId === dead.id) structure.ownerId = null;
+  }
+  logEvent(world, 'inherit', `${dead.name}没有继承人，留下了一座空宅。`, dead.id);
 }
 
 function damage(world, target, amount, by) {
@@ -882,13 +983,13 @@ function runAction(world, a) {
       if (a.inventory[resource] >= need && !structureAt(world, a.x, a.y)) {
         a.inventory[resource] -= need;
         growSkill(a, 'build', 0.1);
-        const s = { type: act.build, x: a.x, y: a.y };
+        const s = { type: act.build, x: a.x, y: a.y, ownerId: a.id };
         if (act.build === 'fire') s.fuel = 600;
         world.structures.push(s);
         const madeCamp =
           act.build === 'fire' &&
           !world.structures.some((o) => o.type === 'camp' && Math.abs(o.x - a.x) + Math.abs(o.y - a.y) <= 3);
-        if (madeCamp) world.structures.push({ type: 'camp', x: a.x, y: a.y });
+        if (madeCamp) world.structures.push({ type: 'camp', x: a.x, y: a.y, ownerId: a.id });
         const names = { fire: '火堆', shelter: '窝棚', wall: '墙' };
         const built = logEvent(world, 'build', `${a.name}${why}建起了一个${names[act.build] || act.build}。`, a.id);
         recordFact(world, {
@@ -983,7 +1084,95 @@ function runAction(world, a) {
         growSkill(target, key, 0.1 * (1 + a.skills.teach * 0.2));
         growSkill(a, 'teach', 0.1);
         recordTeaching(world, a, target, { key, kind: 'skill', label: SKILL_LABEL[key] || key });
+        taught = true;
       }
+
+      if (taught) {
+        a.relationships[target.id] = (a.relationships[target.id] || 0) + 4;
+        target.relationships[a.id] = (target.relationships[a.id] || 0) + 4;
+      }
+      break;
+    }
+
+    case 'adopt': {
+      if (act.remaining > 0) break;
+      const target = world.agents.find((o) => o.id === act.target && o.alive);
+      if (!target || !adjacent(a, target)) break;
+      if ((a.relationships[target.id] || 0) < 20) {
+        remember(a, '你们还没有熟到那个地步。');
+        break;
+      }
+      const kind = act.kind === 'apprentice' ? 'apprentice' : 'adopted';
+      const label = kind === 'apprentice' ? '收下了一个徒弟' : '收养了一个人';
+      a.heirId = target.id;
+      a.heirKind = kind;
+      target.mentorId = a.id;
+      a.energy = Math.max(0, a.energy - 2);
+      const event = logEvent(world, 'adopt', `${a.name}${label}：${target.name}。`, a.id, {
+        targetId: target.id,
+        kind,
+      });
+      recordFact(world, {
+        type: 'adopt',
+        subjectId: a.id,
+        predicate: 'adopted',
+        object: target.id,
+        kind,
+        eventSeq: event.seq,
+      });
+      recordBelief(world, target, `${a.name}${label}。`, 'relationship', 0.95, {
+        kind: 'adopt',
+        subjectId: a.id,
+        predicate: 'adopted',
+        object: target.id,
+      });
+      remember(a, `你${label}：${target.name}。他会继承你留下的一切。`);
+      remember(target, `${a.name}${label}你。`);
+      break;
+    }
+
+    case 'moveIn': {
+      if (act.remaining > 0) break;
+      let moved = false;
+
+      const shelter = world.structures.find(
+        (s) => s.type === 'shelter' && !s.ownerId && Math.abs(s.x - a.x) + Math.abs(s.y - a.y) <= 1
+      );
+      if (shelter) {
+        shelter.ownerId = a.id;
+        moved = true;
+        logEvent(world, 'settle', `${a.name}搬进了${shelter.name || '一座空宅'}。`, a.id);
+        recordFact(world, {
+          type: 'settle',
+          subjectId: a.id,
+          predicate: 'movedIn',
+          object: 'shelter',
+          x: shelter.x,
+          y: shelter.y,
+        });
+        remember(a, '你搬进了一座空宅。');
+      }
+
+      const remains = world.remains.find(
+        (r) => Math.abs(r.x - a.x) + Math.abs(r.y - a.y) <= 1
+      );
+      if (remains) {
+        transferItems(remains.items, a.inventory);
+        world.remains = world.remains.filter((r) => r !== remains);
+        moved = true;
+        logEvent(world, 'settle', `${a.name}收下了${remains.name}留下的东西。`, a.id);
+        recordFact(world, {
+          type: 'settle',
+          subjectId: a.id,
+          predicate: 'looted',
+          object: remains.name,
+          x: remains.x,
+          y: remains.y,
+        });
+        remember(a, `你收下了${remains.name}留下的东西。`);
+      }
+
+      if (!moved) remember(a, '这里没有可以搬进去的地方。');
       break;
     }
 
@@ -1080,7 +1269,9 @@ function runAction(world, a) {
 
     case 'rest': {
       a.energy = Math.min(100, a.energy + 0.4);
-      if (structureAt(world, a.x, a.y)?.type === 'shelter') a.energy = Math.min(100, a.energy + 0.2);
+      const shelter = structureAt(world, a.x, a.y);
+      const mayUse = shelter?.type === 'shelter' && (!shelter.ownerId || shelter.ownerId === a.id);
+      if (mayUse) a.energy = Math.min(100, a.energy + 0.2);
       break;
     }
 
@@ -1258,6 +1449,7 @@ export function serializeWorld(world) {
     agents: world.agents.map((a) => copyAgentForStorage(a, false)),
     structures: world.structures.map((s) => ({ ...s })),
     wolves: world.wolves.map((w) => ({ ...w })),
+    remains: world.remains.map(copyRemains),
     log: world.log.map(copyEvent),
     eventLog: world.eventLog.map(copyEvent),
     facts: world.facts.map((f) => ({ ...f })),
@@ -1293,6 +1485,7 @@ export function loadWorld(data) {
     agents: data.agents.map((a) => copyAgentForStorage(a, false)),
     structures: data.structures.map((s) => ({ ...s })),
     wolves: data.wolves.map((w) => ({ ...w })),
+    remains: (data.remains || []).map(copyRemains),
     log: data.log.map(copyEvent),
     eventLog: data.eventLog.map(copyEvent),
     facts: (data.facts || []).map((f) => ({ ...f })),
@@ -1360,7 +1553,15 @@ export function snapshot(world) {
       lastSay: a.lastSay,
       inventory: { ...a.inventory },
     })),
-    structures: world.structures.map((s) => ({ type: s.type, x: s.x, y: s.y, name: s.name })),
+    structures: world.structures.map((s) => ({
+      type: s.type,
+      x: s.x,
+      y: s.y,
+      name: s.name,
+      ownerId: s.ownerId || null,
+      vacant: s.type === 'shelter' && !s.ownerId,
+    })),
+    remains: world.remains.slice(-10).map(copyRemains),
     wolves: world.wolves.map((w) => ({ id: w.id, x: w.x, y: w.y, hp: w.hp })),
     log: world.log.slice(-40),
     facts: world.facts.slice(-20).map((f) => ({ ...f })),

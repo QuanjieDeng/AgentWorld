@@ -190,8 +190,40 @@ export function mockDecide(world, a) {
   }
 
   const shelterNear = world.structures.some(
-    (s) => s.type === 'shelter' && Math.abs(s.x - a.x) + Math.abs(s.y - a.y) <= 4
+    (s) => s.type === 'shelter' && s.ownerId && Math.abs(s.x - a.x) + Math.abs(s.y - a.y) <= 4
   );
+
+  // 空宅和遗产：没人继承的东西，谁先搬进去就是谁的。
+  const vacant = world.structures.find(
+    (s) => s.type === 'shelter' && !s.ownerId && Math.abs(s.x - a.x) + Math.abs(s.y - a.y) <= 12
+  );
+  const remains = world.remains.find(
+    (r) => Math.abs(r.x - a.x) + Math.abs(r.y - a.y) <= 12
+  );
+  const destination = remains && a.hunger < 50 ? remains : vacant;
+  if (destination && !shelterNear) {
+    if (Math.abs(destination.x - a.x) + Math.abs(destination.y - a.y) <= 1) {
+      return { type: 'moveIn', remaining: 1 };
+    }
+    return moveToward(a, destination.x, destination.y);
+  }
+
+  // 没有继承人时，遇到足够亲近的人就收养或收徒。
+  if (!a.heirId && world.rng() < 0.05) {
+    const close = nearestAgent(world, a, 2, (o) => (a.relationships[o.id] || 0) >= 15);
+    if (close) {
+      if (Math.abs(close.x - a.x) + Math.abs(close.y - a.y) <= 1) {
+        return {
+          type: 'adopt',
+          target: close.id,
+          kind: (a.skills.teach || 0) >= 2 ? 'apprentice' : 'adopted',
+          remaining: 1,
+        };
+      }
+      return moveToward(a, close.x, close.y);
+    }
+  }
+
   if (a.knows.shelter && !shelterNear && a.inventory.wood >= 15 && world.rng() < 0.05) {
     return { type: 'build', build: 'shelter', reason: '想有个能挡风的地方', remaining: 40 };
   }
@@ -259,8 +291,13 @@ function describePerception(world, a) {
     .slice(0, 5)
     .map(({ structure: s, dist, dir }) => {
       const name = { fire: '火堆', shelter: '窝棚', wall: '墙', grave: '坟', camp: '营地' }[s.type] || s.type;
-      return `${name}在你${dir}边大约${dist}步远`;
+      const state = s.type === 'shelter' && !s.ownerId ? '（空着）' : '';
+      return `${name}${state}在你${dir}边大约${dist}步远`;
     });
+
+  const remains = world.remains
+    .filter((r) => Math.abs(r.x - a.x) + Math.abs(r.y - a.y) <= 10)
+    .map((r) => `${r.name}留下的东西在你${DIR_NAMES[dirTo(a, r.x, r.y)]}边大约${Math.abs(r.x - a.x) + Math.abs(r.y - a.y)}步远`);
 
   const wolves = visibleWolves(world, a).map(
     ({ dist, dir }) => `一头野兽在你${dir}边大约${dist}步远`
@@ -274,6 +311,7 @@ function describePerception(world, a) {
     heard: heard.join('；') || '四周很安静',
     res: [...new Set(res)].slice(0, 8).join('；') || '没有',
     structs: structs.join('；') || '没有',
+    remains: remains.join('；') || '没有',
     wolves: wolves.join('；'),
     water: water
       ? `最近的水在你${DIR_NAMES[dirTo(a, water.x, water.y)]}边大约${Math.abs(water.x - a.x) + Math.abs(water.y - a.y)}格`
@@ -295,6 +333,8 @@ function buildPrompt(world, a) {
   const user = `时间：第${world.day}天 ${world.clock}（${world.isNight ? '夜' : '昼'}）
 你的位置：(${a.x},${a.y})，可走的方向：${canWalk.map((d) => DIR_NAMES[d]).join('、') || '无'}
 状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}
+${a.mentorId ? `收养你的人：${world.agents.find((x) => x.id === a.mentorId)?.name || '某个人'}` : ''}
+${a.inheritedObsession ? `你接过了${a.inheritedFrom}没做完的事：${a.inheritedObsession}` : ''}
 你刚才：${a.lastAction || '刚醒来'}
 背包：食物${a.inventory.food}，木头${a.inventory.wood}，石头${a.inventory.stone}，${a.inventory.weapon ? '有武器' : '赤手空拳'}
 你会：${Object.entries(a.skills).filter(([, v]) => v > 0).map(([k, v]) => `${SKILL_LABEL[k] || k}${v.toFixed(1)}`).join('、')}
@@ -303,6 +343,7 @@ function buildPrompt(world, a) {
 ${Object.keys(a.learning || {}).length ? `你正在学：${Object.entries(a.learning).map(([k, v]) => `${KNOWLEDGE_LABEL[k]}（${Math.round(v * 100)}%）`).join('、')}` : ''}
 你看见的人：${near.seen}
 你看见的建筑：${near.structs}
+无人继承的遗产：${near.remains}
 ${near.wolves ? `你看见的野兽：${near.wolves}` : ''}
 你听见：${near.heard}
 身边的资源：${near.res}
@@ -311,7 +352,7 @@ ${near.water}
 你相信最近发生的事：${a.beliefs.slice(-3).map((b) => b.proposition).join('；') || '没有'}
 ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 
-规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
+规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
 
 选择你接下来的行动。只输出一个 JSON：
 {"action":"move","dir":"N|S|E|W","steps":1到8}
@@ -323,6 +364,8 @@ ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 {"action":"build","build":"fire|shelter|wall","reason":"为什么要建"}
 {"action":"talk","target":"名字","say":"一句话"}
 {"action":"teach","target":"名字","skill":"${[...new Set([...KNOWLEDGE_KEYS, ...SKILL_KEYS])].join('|')}","reason":"为什么要教"}
+{"action":"adopt","target":"名字","kind":"adopted|apprentice","reason":"为什么要把身后事交给他"}
+{"action":"moveIn","reason":"为什么要搬进去"}
 {"action":"attack","target":"名字或野兽","reason":"为什么动手"}
 {"action":"flee","reason":"为什么要逃"}
 {"action":"rest"}
@@ -348,7 +391,7 @@ function normalize(world, a, raw) {
   if (!obj || typeof obj !== 'object') return null;
 
   const whyText = String(obj.reason || obj.why || '').slice(0, 60);
-  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
+  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'adopt', 'moveIn', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
   const action = ACTIONS.includes(obj.action) ? obj.action : ACTIONS.includes(obj.type) ? obj.type : null;
 
   if (action === 'move') {
@@ -398,6 +441,20 @@ function normalize(world, a, raw) {
     if (![...KNOWLEDGE_KEYS, ...SKILL_KEYS].includes(skill)) return null;
     return { type: 'teach', target: t.id, skill, reason: whyText, remaining: 1 };
   }
+  if (action === 'adopt') {
+    const targetName = obj.target ?? obj.to ?? obj.name;
+    const t = world.agents.find((o) => o.alive && (o.name === targetName || o.id === targetName));
+    if (!t) return null;
+    if (Math.abs(t.x - a.x) + Math.abs(t.y - a.y) > 1) return moveToward(a, t.x, t.y);
+    return {
+      type: 'adopt',
+      target: t.id,
+      kind: obj.kind === 'apprentice' ? 'apprentice' : 'adopted',
+      reason: whyText,
+      remaining: 1,
+    };
+  }
+  if (action === 'moveIn') return { type: 'moveIn', reason: whyText, remaining: 1 };
   if (action === 'attack') {
     const t = String(obj.target ?? obj.to ?? obj.name ?? '');
     const reason = String(obj.reason || obj.why || '').slice(0, 60);

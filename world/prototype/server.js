@@ -5,7 +5,7 @@ import http from 'node:http';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createWorld, snapshot, serializeWorld, loadWorld, logEvent, remember, MS_PER_TICK } from './engine.js';
+import { createWorld, snapshot, serializeWorld, loadWorld, deliverLetter, MS_PER_TICK } from './engine.js';
 import { advanceOffline, stepWorld } from './persistence.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -103,10 +103,8 @@ async function handleApi(req, res, url) {
     if (!a) return json(res, { ok: false, error: 'no such agent' }, 404);
     const text = String(body.text || '').slice(0, 160).trim();
     if (!text) return json(res, { ok: false, error: 'empty' }, 400);
-    a.letter = text;
-    remember(a, `你听见一个声音说：「${text}」`);
-    logEvent(world, 'letter', `一个声音在${a.name}耳边说：「${text}」`, a.id, { text });
-    return json(res, { ok: true });
+    const heard = deliverLetter(world, a, text);
+    return json(res, { ok: true, heard });
   }
 
   if (url.pathname === '/api/config') {
