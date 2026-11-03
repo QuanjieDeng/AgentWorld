@@ -29,10 +29,25 @@ const SAVE = process.env.SAVE_FILE
 const SEED = Number(process.env.SEED) || 20261102;
 const NODE_ID = String(process.env.NODE_ID || `node-${PORT}`).slice(0, 32);
 const MIRROR = process.env.MIRROR === '1';
+const SYNC_MODE = MIRROR ? 'mirror' : String(process.env.SYNC_MODE || 'standalone');
+const PEER = SYNC_MODE === 'peer';
 const SYNC_TOKEN = String(process.env.SYNC_TOKEN || '');
 const PEER_URL = String(process.env.PEER_URL || '').replace(/\/+$/, '');
+const PEERS = String(process.env.PEERS || '')
+  .split(',')
+  .map((s) => s.trim().replace(/\/+$/, ''))
+  .filter(Boolean);
+const NODE_NAMES = String(process.env.NODES || NODE_ID)
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+if (!NODE_NAMES.includes(NODE_ID)) NODE_NAMES.push(NODE_ID);
+const NODES = [...new Set(NODE_NAMES)].sort();
+const TERM_EVENTS = Math.max(10, Number(process.env.TERM_EVENTS) || 200);
+const HANDOFF_SETTLE_MS = Math.max(0, Number(process.env.HANDOFF_SETTLE_MS) || 500);
 const SYNC_INTERVAL_MS = Math.max(100, Number(process.env.SYNC_INTERVAL_MS) || 2000);
 const SAVE_INTERVAL_MS = Math.max(500, Number(process.env.SAVE_INTERVAL_MS) || 10_000);
+const SPEED = Math.max(1, Math.min(8, Number(process.env.SPEED) || 1));
 
 function loadOrCreate() {
   if (!fs.existsSync(SAVE)) return createWorld(SEED);
@@ -40,12 +55,12 @@ function loadOrCreate() {
     const data = JSON.parse(fs.readFileSync(SAVE, 'utf8'));
     const loaded = loadWorld(data.world);
     const elapsed = Math.max(0, Date.now() - (Number(data.savedAt) || Date.now()));
-    if (!MIRROR) {
+    if (MIRROR || PEER) {
+      loaded.returnSummary = null;
+      console.log(`  从存档恢复：第 ${loaded.day} 天 · 等待同步`);
+    } else {
       loaded.returnSummary = advanceOffline(loaded, elapsed);
       console.log(`  从存档恢复：第 ${loaded.day} 天 · 离线推进 ${loaded.returnSummary.ticks} tick`);
-    } else {
-      loaded.returnSummary = null;
-      console.log(`  从镜像存档恢复：第 ${loaded.day} 天 · 等待主节点追平`);
     }
     return loaded;
   } catch (err) {
@@ -55,11 +70,43 @@ function loadOrCreate() {
 }
 
 let world = loadOrCreate();
+world.config.speed = SPEED;
 const clients = new Set();
 
 let lastSyncAt = 0;
 let lastSyncError = '';
 let lastSyncedTick = -1;
+let syncing = false;
+let syncFault = '';
+let handoffReady = false;
+let handoffStart = 0;
+
+// 轮值日志权威：term 由已产生的事件数决定，所有节点从同一条日志算出同一个排序。
+function currentTerm(seq = world.nextSeq) {
+  return Math.floor(Math.max(0, seq - 1) / TERM_EVENTS);
+}
+
+function authorityFor(term = currentTerm()) {
+  if (!PEER) return NODE_ID;
+  return NODES[((term % NODES.length) + NODES.length) % NODES.length];
+}
+
+function isAuthority() {
+  return !PEER || authorityFor() === NODE_ID;
+}
+
+function canWriteLocally() {
+  if (MIRROR) return false;
+  if (!PEER) return true;
+  return isAuthority() && handoffReady && !syncFault;
+}
+
+function canAdvance() {
+  if (MIRROR) return false;
+  if (world.config.paused) return false;
+  if (!PEER) return true;
+  return !syncFault && isAuthority() && handoffReady;
+}
 
 function applyApiConfig(source) {
   world.api.provider = source.provider === 'anthropic' ? 'anthropic' : 'openai';
@@ -145,20 +192,20 @@ async function handleApi(req, res, url) {
   const body = await readBody(req);
 
   if (url.pathname === '/api/pause') {
-    if (MIRROR) return json(res, { ok: false, error: 'mirror is read-only' }, 403);
+    if (!canWriteLocally()) return json(res, { ok: false, error: 'this node is read-only right now' }, 403);
     world.config.paused = !!body.paused;
     return json(res, { ok: true, paused: world.config.paused });
   }
 
   if (url.pathname === '/api/speed') {
-    if (MIRROR) return json(res, { ok: false, error: 'mirror is read-only' }, 403);
+    if (!canWriteLocally()) return json(res, { ok: false, error: 'this node is read-only right now' }, 403);
     const s = Math.max(1, Math.min(8, Number(body.speed) || 1));
     world.config.speed = s;
     return json(res, { ok: true, speed: s });
   }
 
   if (url.pathname === '/api/whisper') {
-    if (MIRROR) return json(res, { ok: false, error: 'mirror is read-only' }, 403);
+    if (!canWriteLocally()) return json(res, { ok: false, error: 'this node is read-only right now' }, 403);
     const a = world.agents.find((x) => x.id === body.agentId);
     if (!a) return json(res, { ok: false, error: 'no such agent' }, 404);
     const cooldown = letterCooldownLeft(world, a);
@@ -194,8 +241,18 @@ async function handleApi(req, res, url) {
       events: world.nextSeq - 1,
       journalHash: exportJournal(world).eventsHash,
       stateHash: stateHash(world),
+      mode: SYNC_MODE,
       mirror: MIRROR,
       peer: PEER_URL || null,
+      peers: PEERS,
+      role: PEER ? (isAuthority() ? 'authority' : 'follower') : MIRROR ? 'mirror' : 'standalone',
+      term: PEER ? currentTerm() : null,
+      termEvents: PEER ? TERM_EVENTS : null,
+      nodes: PEER ? NODES : [],
+      authorityId: PEER ? authorityFor() : null,
+      handoffReady: PEER ? handoffReady : null,
+      syncFault: syncFault || null,
+      canWrite: canWriteLocally(),
       lastSyncAt: lastSyncAt || null,
       lastSyncedTick,
       lastSyncError,
@@ -208,13 +265,13 @@ async function handleApi(req, res, url) {
     return json(res, { ok: true, savedAt: Date.now(), tick: world.tick, stateHash: stateHash(world) });
   }
 
-  // 镜像节点接收对方的日志块。只读节点不接受别人的状态，避免误覆盖。
+  // 接收日志块：镜像模式用于演示推送，peer 模式用于手动/测试导入。
   if (url.pathname === '/api/journal/apply') {
-    if (!MIRROR) {
-      return json(res, { ok: false, error: 'this node is not a mirror' }, 403);
+    if (!MIRROR && !PEER) {
+      return json(res, { ok: false, error: 'journal apply is disabled on standalone nodes' }, 403);
     }
     if (!SYNC_TOKEN) {
-      return json(res, { ok: false, error: 'SYNC_TOKEN is required on mirror nodes' }, 503);
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required for journal apply' }, 503);
     }
     const supplied = Buffer.from(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
     const expected = Buffer.from(SYNC_TOKEN);
@@ -224,6 +281,7 @@ async function handleApi(req, res, url) {
     const result = applyChunk(world, body);
     if (!result.ok) return json(res, { ok: false, ...result }, 400);
     if (!result.matched) {
+      if (PEER) syncFault = 'state hash mismatch';
       return json(
         res,
         { ok: false, error: 'state hash mismatch', local: stateHash(result.world), claimed: body.stateHash },
@@ -234,6 +292,11 @@ async function handleApi(req, res, url) {
     lastSyncAt = Date.now();
     lastSyncedTick = world.tick;
     lastSyncError = '';
+    if (PEER) {
+      // 收到别人的日志后，先重新交接，再决定能不能写。
+      handoffReady = false;
+      handoffStart = 0;
+    }
     return json(res, {
       ok: true,
       tick: world.tick,
@@ -350,7 +413,7 @@ function broadcast() {
 }
 
 async function syncPeer() {
-  if (MIRROR || !PEER_URL || !SYNC_TOKEN || world.inflight > 0) return;
+  if (PEER || MIRROR || !PEER_URL || !SYNC_TOKEN || world.inflight > 0) return;
 
   try {
     const identityResponse = await fetch(`${PEER_URL}/api/identity`, {
@@ -398,6 +461,85 @@ async function syncPeer() {
   }
 }
 
+// peer 模式：每个节点都从对端拉缺失日志。谁拉谁都不改变“日志是权威”这条。
+async function pullFromPeer(peer) {
+  const identityResponse = await fetch(`${peer}/api/identity`, {
+    signal: AbortSignal.timeout(5000),
+  });
+  if (!identityResponse.ok) throw new Error(`peer identity HTTP ${identityResponse.status}`);
+  const identity = await identityResponse.json();
+  if (identity.seed !== world.seed) throw new Error('conflict: peer seed mismatch');
+
+  const localHead = world.nextSeq - 1;
+  if (identity.events < localHead) return { behind: true };
+
+  if (identity.events === localHead) {
+    // 头部相同却没有同一个状态，说明已经分叉，必须停下来。
+    if (identity.tick === world.tick && identity.stateHash !== stateHash(world)) {
+      throw new Error('conflict: same head but state hash differs');
+    }
+    return { noop: true };
+  }
+
+  const journalResponse = await fetch(
+    `${peer}/api/journal?fromSeq=${world.nextSeq}&nodeId=${encodeURIComponent(NODE_ID)}`,
+    { signal: AbortSignal.timeout(10_000) }
+  );
+  if (!journalResponse.ok) throw new Error(`peer journal HTTP ${journalResponse.status}`);
+  const chunk = await journalResponse.json();
+  if (!chunk.events?.length) return { noop: true };
+
+  const result = applyChunk(world, chunk);
+  if (!result.ok) {
+    if (result.reason === 'stale chunk') return { stale: true };
+    throw new Error(`conflict: ${result.reason}`);
+  }
+  if (!result.matched) throw new Error('conflict: state hash mismatch');
+
+  world = result.world;
+  lastSyncAt = Date.now();
+  lastSyncedTick = world.tick;
+  lastSyncError = '';
+  return { applied: true, tick: world.tick };
+}
+
+async function syncPeers() {
+  if (!PEER || syncing || world.inflight > 0) return;
+  syncing = true;
+
+  let allOk = true;
+  let firstError = '';
+  for (const peer of PEERS) {
+    try {
+      await pullFromPeer(peer);
+    } catch (err) {
+      allOk = false;
+      const message = String(err?.message || err);
+      if (!firstError) firstError = message;
+      if (message.startsWith('conflict:')) syncFault = message;
+    }
+  }
+
+  lastSyncError = firstError;
+
+  if (!PEER) {
+    syncing = false;
+    return;
+  }
+
+  if (!isAuthority()) {
+    handoffReady = false;
+    handoffStart = 0;
+  } else if (syncFault) {
+    handoffReady = false;
+  } else {
+    if (!handoffStart) handoffStart = Date.now();
+    if (allOk && Date.now() - handoffStart >= HANDOFF_SETTLE_MS) handoffReady = true;
+  }
+
+  syncing = false;
+}
+
 // 24 倍：1 现实小时 = 1 世界日。按真实经过时间累积 tick，和离线推进同一把尺子。
 let lastTickAt = Date.now();
 let tickCarry = 0;
@@ -405,12 +547,17 @@ setInterval(() => {
   const now = Date.now();
   const elapsed = now - lastTickAt;
   lastTickAt = now;
-  if (!MIRROR && !world.config.paused) {
+  if (canAdvance()) {
     const speed = Math.max(1, world.config.speed | 0);
     tickCarry += elapsed * speed;
     while (tickCarry >= MS_PER_TICK) {
       stepWorld(world, 1);
       tickCarry -= MS_PER_TICK;
+      if (!canAdvance()) {
+        // 任期内事件数已经跨过边界，或节点失去权威，交给下一个节点。
+        tickCarry = 0;
+        break;
+      }
     }
   } else {
     tickCarry = 0;
@@ -429,7 +576,8 @@ function saveWorld() {
 }
 
 setInterval(saveWorld, SAVE_INTERVAL_MS).unref();
-if (PEER_URL && !MIRROR) setInterval(syncPeer, SYNC_INTERVAL_MS).unref();
+if (PEER) setInterval(syncPeers, SYNC_INTERVAL_MS).unref();
+else if (PEER_URL && !MIRROR) setInterval(syncPeer, SYNC_INTERVAL_MS).unref();
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
@@ -439,9 +587,16 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 server.listen(PORT, () => {
-  console.log(`\n  最后的岛 · ${MIRROR ? '镜像节点' : '主节点'}`);
+  console.log(`\n  最后的岛 · ${PEER ? '全节点' : MIRROR ? '镜像节点' : '独立节点'}`);
   console.log(`  ${NODE_ID} · seed ${world.seed} · http://localhost:${PORT}`);
-  if (PEER_URL && !MIRROR) {
+  if (PEER) {
+    console.log(
+      `  peer 模式 · 节点 ${NODES.join(', ')} · 每 ${TERM_EVENTS} 条事件轮换 · 当前第 ${currentTerm()} 任：${authorityFor()}`
+    );
+    console.log(`  对端：${PEERS.length ? PEERS.join(', ') : '（无，单节点）'}`);
+    if (!SYNC_TOKEN) console.warn('  警告：未配置 SYNC_TOKEN，其他节点无法向本节点写入日志。');
+    syncPeers();
+  } else if (PEER_URL && !MIRROR) {
     console.log(`  同步目标：${PEER_URL} · 每 ${SYNC_INTERVAL_MS} ms 轮询`);
     syncPeer();
   }

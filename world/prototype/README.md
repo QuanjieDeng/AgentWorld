@@ -53,21 +53,42 @@ node server.js
 
 ## B 阶段地基：同步日志
 
-> 这里的“单主 → 镜像”是**演示 / 回归模式**，不是最终架构。最终目标是全节点、无官方服务器、轮值排序；
-> 约束见 [../06-架构-B阶段.md](../06-架构-B阶段.md)。
+> 主路径是 `SYNC_MODE=peer`：全节点、双向拉日志、按事件数轮换日志权威。
+> 单主 → 镜像（`MIRROR=1`）只作为演示 / 回归模式保留。约束见 [../06-架构-B阶段.md](../06-架构-B阶段.md)。
 
-`sync.js` 把事件日志变成可交换的权威输入；`server.js` 已加单主 → 镜像的 HTTP 轮询传输和断线追平：
+`sync.js` 把事件日志变成可交换的权威输入；`server.js` 提供两种传输适配器：
 
 - **导出**：`exportJournal(world)` 生成带种子、序号范围、事件、决策、事件哈希、决策哈希与状态哈希的信封；`fromSeq`/`prevHash` 可切块并串成链。
 - **校验**：`verifyJournal` 检查协议、序号连续、事件哈希、以及决策必须确实是事件的投影；`verifyChain` 检查两块日志首尾相接。
 - **重建**：`rebuildFromJournal` 从种子 + 完整日志逐字节重放回同一个世界；`stateHash` 只覆盖会影响下一步模拟的状态，界面日志、暂停/倍速、API 配置都不算。脱变标签也以日志里的为准，LLM 选过的身份不会在重放时退回确定性标签。
 - **追平**：`applyChunk(localSnapshot, chunk)` 从本地快照 + 对方的一块后续日志追到同一个世界；`catchUp(localWorld, fullJournal)` 用完整日志从零重建。追平后的世界会退出重放模式，可以继续做新决定。
-- **HTTP 轮询**：主节点每隔 `SYNC_INTERVAL_MS`（默认 2 秒）查镜像头部，只发送缺失日志块；镜像不独立推进、不接受写信/暂停/倍速，只校验并应用日志。主节点不可达时镜像保持最后快照；恢复后自动追平。
-- **鉴权**：镜像的写入端点只接受 `SYNC_TOKEN` bearer token；未配置 token 时拒绝写入。状态页显示镜像同步 tick 与错误。
+- **peer 轮值**：每个节点都从对端拉缺失日志块；`term = floor((nextSeq - 1) / TERM_EVENTS)`，`authority = 排序后的节点列表[term % 节点数]`。同一时刻只有当前权威推进模拟，其他节点只读、追平。交接时新权威先拉完日志、等 `HANDOFF_SETTLE_MS` 再写。
+- **分叉处理**：同一头部却 `stateHash` 不同、或重叠事件不一致时，节点记录 `syncFault` 并停止写入，不静默采用对方状态。
+- **鉴权**：`/api/journal/apply` 只接受 `SYNC_TOKEN` bearer token；peer 模式默认用拉取，不需要对端开放写入。状态页显示节点角色、任期、交接状态和同步错误。
 
-### 两台机器运行
+### 全节点轮值（主路径）
 
-先选一个两边共同使用的种子和强随机 token。两台机器各自的 `SAVE_FILE` 必须不同；A 的 `PEER_URL` 指向 B：
+两台机器用同一个 seed、同一份节点名单和强随机 token；`PEERS` 互相指向对方：
+
+```bash
+# A 机（本机可直接用不同 PORT 模拟两台）
+NODE_ID=peer-a SEED=20261102 PORT=4173 \
+SYNC_MODE=peer NODES=peer-a,peer-b PEERS='http://B机局域网地址:4173' \
+SYNC_TOKEN='替换成随机长 token' TERM_EVENTS=200 \
+node server.js
+
+# B 机
+NODE_ID=peer-b SEED=20261102 PORT=4173 \
+SYNC_MODE=peer NODES=peer-a,peer-b PEERS='http://A机局域网地址:4173' \
+SYNC_TOKEN='替换成随机长 token' TERM_EVENTS=200 \
+node server.js
+```
+
+`TERM_EVENTS` 越小，轮换越频繁；默认 200。查看 `/api/identity` 能看到 `role`、`term`、`authorityId`、`handoffReady`、`syncFault`。`test-peer-rotation.js` 会启动两个真实进程，验证两个节点都担任过权威、并且每个任期后状态哈希收敛。
+
+### 镜像演示（旧脚手架）
+
+镜像模式仍是单主 → 镜像，只用于演示和回归。A 的 `PEER_URL` 指向 B：
 
 ```bash
 # A 机：主节点
@@ -75,13 +96,11 @@ NODE_ID=node-a SEED=20261102 PORT=4173 \
 SYNC_TOKEN='替换成随机长 token' PEER_URL='http://B机局域网地址:4173' \
 node server.js
 
-# B 机：镜像节点（在另一台机器执行；seed/token 必须相同）
+# B 机：镜像节点
 NODE_ID=node-b SEED=20261102 PORT=4173 MIRROR=1 \
 SYNC_TOKEN='替换成随机长 token' SAVE_FILE='./world-save-mirror.json' \
 node server.js
 ```
-
-首启时，镜像从同种子初始世界开始；后续通过 HTTP 自动追平。断开 B 机一段时间再启动，A 会按镜像保存的日志头补发缺失事件。查看任一端的 `http://localhost:4173/api/identity` 可见当前状态哈希、节点角色与同步错误。
 
 也可以手动导出/验证，或把日志拷到离线机器：
 
@@ -92,7 +111,7 @@ curl -X POST http://B机地址:4173/api/journal/verify \\
 node sync-check.js journal.json
 ```
 
-`SYNC_TOKEN` 经普通 HTTP 传输，**只在可信 LAN/VPN 演示**；不可直接暴露到公网。哈希是完整性校验（FNV-1a 64），**不是密码学签名**；仍未实现节点身份签名、轮值排序、双主冲突处理。
+`SYNC_TOKEN` 经普通 HTTP 传输，**只在可信 LAN/VPN 演示**；不可直接暴露到公网。哈希是完整性校验（FNV-1a 64），**不是密码学签名**。`TERM_EVENTS` 轮值目前要求对端可达才能完成交接；失联后的租约过期、节点签名、TLS 与双主冲突处理仍未实现。
 
 ## 接入你自己的模型
 

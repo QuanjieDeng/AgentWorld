@@ -75,7 +75,7 @@ const RESOURCE_LABEL = { food: '食物', wood: '木头', stone: '石头', weapon
 const PARAMS = new URLSearchParams(location.search);
 
 let state = null;
-let mirrorMode = false;
+let readOnlyMode = false;
 let selectedId = PARAMS.get('select') || null;
 let mode = PARAMS.get('mode') === 'island' ? 'island' : 'follow';
 let agentTab = 'facts';
@@ -124,7 +124,20 @@ async function refreshSyncStatus() {
     const info = await res.json();
     let text;
     let status = 'idle';
-    if (info.mirror) {
+    if (info.mode === 'peer') {
+      if (info.syncFault) {
+        text = `同步故障：${info.syncFault}`;
+        status = 'error';
+      } else if (info.role === 'authority') {
+        text = info.handoffReady
+          ? `主节点 · 第 ${info.term} 任 · 正在写`
+          : `主节点 · 第 ${info.term} 任 · 交接中`;
+        status = 'ok';
+      } else {
+        text = `跟随中 · 第 ${info.term} 任由 ${info.authorityId} 写入`;
+        status = info.lastSyncError ? 'error' : info.lastSyncAt ? 'ok' : 'idle';
+      }
+    } else if (info.mirror) {
       text = info.lastSyncError
         ? `镜像 · 同步中断：${info.lastSyncError}`
         : info.lastSyncAt
@@ -141,7 +154,7 @@ async function refreshSyncStatus() {
     } else {
       text = '单机 · 未配置同步';
     }
-    mirrorMode = !!info.mirror;
+    readOnlyMode = info.canWrite === false;
     syncStatusEl.textContent = text;
     syncStatusEl.title = `${info.nodeId} · seed ${info.seed} · ${text}`;
     syncStatusEl.dataset.state = status;
@@ -387,7 +400,7 @@ function renderAgentPanel() {
   const a = agentById(selectedId);
   const alive = a && a.alive;
 
-  whisperInput.disabled = mirrorMode || !alive || (a && a.letterCooldownLeft > 0);
+  whisperInput.disabled = readOnlyMode || !alive || (a && a.letterCooldownLeft > 0);
   whisperBtn.disabled = whisperInput.disabled;
 
   if (!a) {
@@ -707,9 +720,9 @@ function updateUI() {
   clockEl.textContent = `第 ${state.day} 天 · ${state.clock}${state.isNight ? ' · 夜' : ''}`;
   popEl.textContent = `活着 ${state.population} / ${state.agents.length}`;
   pauseBtn.textContent = state.paused ? '继续' : '暂停';
-  pauseBtn.disabled = mirrorMode;
+  pauseBtn.disabled = readOnlyMode;
   document.querySelectorAll('.speed').forEach((b) => {
-    b.disabled = mirrorMode;
+    b.disabled = readOnlyMode;
   });
 
   if (brainStatus) {
@@ -906,7 +919,7 @@ function acceptState(next) {
 }
 
 refreshSyncStatus();
-setInterval(refreshSyncStatus, 5000);
+setInterval(refreshSyncStatus, 3000);
 
 // ?static=1：不接 SSE，只拉一次状态。给截图和离线调试用。
 if (PARAMS.has('static')) {
