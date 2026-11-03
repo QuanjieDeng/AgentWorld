@@ -67,10 +67,10 @@ function isolate(world, keep = null) {
   console.log('2 天后坟边灌木:', bushes);
 }
 
-// 3. 水边捕鱼
+// 3. 水边捕鱼（老唐是渔夫，天生会捕鱼）
 {
   const w = createWorld(1);
-  const a = w.agents[0];
+  const a = w.agents.find((x) => x.name === '老唐');
   isolate(w, a);
 
   let spot = null;
@@ -105,10 +105,10 @@ function isolate(world, keep = null) {
   }
 }
 
-// 4. 耕种
+// 4. 耕种（林氏是农妇，天生会种）
 {
   const w = createWorld(1);
-  const a = w.agents[0];
+  const a = w.agents.find((x) => x.name === '林氏');
   isolate(w, a);
   a.x = 20;
   a.y = 20;

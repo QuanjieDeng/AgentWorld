@@ -1,7 +1,19 @@
 // brain.js — 两种大脑：规则驱动（默认）与 LLM 驱动（玩家自带 key）。
 // 两者都只能提交"意图"，引擎负责判定。
 
-import { TILE, W, H, DIRS, resourceNear, isWalkable, logDecision } from './engine.js';
+import {
+  TILE,
+  W,
+  H,
+  DIRS,
+  KNOWLEDGE_KEYS,
+  KNOWLEDGE_LABEL,
+  SKILL_KEYS,
+  SKILL_LABEL,
+  resourceNear,
+  isWalkable,
+  logDecision,
+} from './engine.js';
 import { visibleAgents, visibleStructures, visibleWolves, heardSounds } from './perception.js';
 
 const DIR_NAMES = { N: '北', S: '南', W: '西', E: '东' };
@@ -126,9 +138,11 @@ export function mockDecide(world, a) {
       if (Math.abs(foodTree.x - a.x) + Math.abs(foodTree.y - a.y) <= 1) return { type: 'gather', remaining: 6 };
       return moveToward(a, foodTree.x, foodTree.y);
     }
-    if (adjacentWater(world, a)) return { type: 'fish', remaining: 60 };
-    const water = nearestTile(world, a, [TILE.WATER], 16);
-    if (water) return moveToward(a, water.x, water.y);
+    if (a.knows.fish && adjacentWater(world, a)) return { type: 'fish', remaining: 60 };
+    if (a.knows.fish) {
+      const water = nearestTile(world, a, [TILE.WATER], 16);
+      if (water) return moveToward(a, water.x, water.y);
+    }
   }
 
   // 夜：回营地
@@ -140,13 +154,18 @@ export function mockDecide(world, a) {
         (s) => s.type === 'fire' && Math.abs(s.x - camp.x) + Math.abs(s.y - camp.y) <= 2
       );
       if (!fireAtCamp) {
-        if (d <= 1 && a.inventory.wood >= 5) return { type: 'build', build: 'fire', remaining: 20 };
+        if (d <= 1 && a.inventory.wood >= 5 && a.knows.fire) {
+          return { type: 'build', build: 'fire', remaining: 20 };
+        }
+        if (d <= 2 && !a.knows.fire) return { type: 'rest', remaining: 30 };
         return moveToward(a, camp.x, camp.y);
       }
       if (d <= 2) return { type: 'rest', remaining: 30 };
       return moveToward(a, camp.x, camp.y);
     }
-    if (a.inventory.wood >= 5) return { type: 'build', build: 'fire', reason: '天黑了，得有火', remaining: 20 };
+    if (a.inventory.wood >= 5 && a.knows.fire) {
+      return { type: 'build', build: 'fire', reason: '天黑了，得有火', remaining: 20 };
+    }
     const tree = nearestTile(world, a, [TILE.TREE], 16);
     if (tree) {
       if (Math.abs(tree.x - a.x) + Math.abs(tree.y - a.y) <= 1) return { type: 'gather', remaining: 6 };
@@ -161,6 +180,7 @@ export function mockDecide(world, a) {
   if (nearRes) return { type: 'gather', remaining: 6 };
 
   if (
+    a.knows.farm &&
     a.inventory.food >= 6 &&
     world.map[a.y * W + a.x] === TILE.GRASS &&
     !world.structures.some((s) => s.x === a.x && s.y === a.y) &&
@@ -172,11 +192,28 @@ export function mockDecide(world, a) {
   const shelterNear = world.structures.some(
     (s) => s.type === 'shelter' && Math.abs(s.x - a.x) + Math.abs(s.y - a.y) <= 4
   );
-  if (!shelterNear && a.inventory.wood >= 15 && world.rng() < 0.05) {
+  if (a.knows.shelter && !shelterNear && a.inventory.wood >= 15 && world.rng() < 0.05) {
     return { type: 'build', build: 'shelter', reason: '想有个能挡风的地方', remaining: 40 };
   }
-  if (a.inventory.stone >= 8 && world.rng() < 0.03) {
+  if (a.knows.wall && a.inventory.stone >= 8 && world.rng() < 0.03) {
     return { type: 'build', build: 'wall', reason: '想把这里围起来', remaining: 30 };
+  }
+
+  // 教身边人一件自己会、对方不会的事。知识和技能都会流动。
+  if (world.rng() < 0.12) {
+    const other = nearestAgent(world, a, 2);
+    if (other) {
+      const missing = KNOWLEDGE_KEYS.find((k) => a.knows[k] && !other.knows[k]);
+      const lesson = missing || SKILL_KEYS.filter((k) => k !== 'teach').find(
+        (k) => (a.skills[k] || 0) >= 3 && (other.skills[k] || 0) < a.skills[k] - 1
+      );
+      if (lesson) {
+        if (Math.abs(other.x - a.x) + Math.abs(other.y - a.y) <= 1) {
+          return { type: 'teach', target: other.id, skill: lesson, remaining: 1 };
+        }
+        return moveToward(a, other.x, other.y);
+      }
+    }
   }
 
   if (a.inventory.food > 0 && world.rng() < 0.18) {
@@ -260,6 +297,10 @@ function buildPrompt(world, a) {
 状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}
 你刚才：${a.lastAction || '刚醒来'}
 背包：食物${a.inventory.food}，木头${a.inventory.wood}，石头${a.inventory.stone}，${a.inventory.weapon ? '有武器' : '赤手空拳'}
+你会：${Object.entries(a.skills).filter(([, v]) => v > 0).map(([k, v]) => `${SKILL_LABEL[k] || k}${v.toFixed(1)}`).join('、')}
+你会做的事：${KNOWLEDGE_KEYS.filter((k) => a.knows[k]).map((k) => KNOWLEDGE_LABEL[k]).join('、') || '没有'}
+你不会做的事：${KNOWLEDGE_KEYS.filter((k) => !a.knows[k]).map((k) => KNOWLEDGE_LABEL[k]).join('、') || '没有'}
+${Object.keys(a.learning || {}).length ? `你正在学：${Object.entries(a.learning).map(([k, v]) => `${KNOWLEDGE_LABEL[k]}（${Math.round(v * 100)}%）`).join('、')}` : ''}
 你看见的人：${near.seen}
 你看见的建筑：${near.structs}
 ${near.wolves ? `你看见的野兽：${near.wolves}` : ''}
@@ -269,7 +310,7 @@ ${near.water}
 最近发生：${a.memory.slice(-4).join('；') || '没有'}
 ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 
-规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
+规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
 
 选择你接下来的行动。只输出一个 JSON：
 {"action":"move","dir":"N|S|E|W","steps":1到8}
@@ -280,6 +321,7 @@ ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 {"action":"craft","reason":"为什么要做"}
 {"action":"build","build":"fire|shelter|wall","reason":"为什么要建"}
 {"action":"talk","target":"名字","say":"一句话"}
+{"action":"teach","target":"名字","skill":"${[...new Set([...KNOWLEDGE_KEYS, ...SKILL_KEYS])].join('|')}","reason":"为什么要教"}
 {"action":"attack","target":"名字或野兽","reason":"为什么动手"}
 {"action":"flee","reason":"为什么要逃"}
 {"action":"rest"}
@@ -305,7 +347,7 @@ function normalize(world, a, raw) {
   if (!obj || typeof obj !== 'object') return null;
 
   const whyText = String(obj.reason || obj.why || '').slice(0, 60);
-  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
+  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
   const action = ACTIONS.includes(obj.action) ? obj.action : ACTIONS.includes(obj.type) ? obj.type : null;
 
   if (action === 'move') {
@@ -345,6 +387,15 @@ function normalize(world, a, raw) {
     if (!t) return null;
     if (Math.abs(t.x - a.x) + Math.abs(t.y - a.y) > 1) return moveToward(a, t.x, t.y);
     return { type: 'talk', target: t.id, say: String(obj.say || obj.text || obj.message || '').slice(0, 80), remaining: 2 };
+  }
+  if (action === 'teach') {
+    const targetName = obj.target ?? obj.to ?? obj.name;
+    const t = world.agents.find((o) => o.alive && (o.name === targetName || o.id === targetName));
+    if (!t) return null;
+    if (Math.abs(t.x - a.x) + Math.abs(t.y - a.y) > 1) return moveToward(a, t.x, t.y);
+    const skill = String(obj.skill ?? obj.what ?? '').trim();
+    if (![...KNOWLEDGE_KEYS, ...SKILL_KEYS].includes(skill)) return null;
+    return { type: 'teach', target: t.id, skill, reason: whyText, remaining: 1 };
   }
   if (action === 'attack') {
     const t = String(obj.target ?? obj.to ?? obj.name ?? '');
