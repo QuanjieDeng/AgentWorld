@@ -19,7 +19,7 @@ function deathScene() {
   const world = createWorld(7);
   const victim = agent(world, '阿禾');
   const witness = agent(world, '陈默');
-  const listener = agent(world, '白姨');
+  const listener = agent(world, '林氏');
   victim.x = 20;
   victim.y = 20;
   witness.x = 21;
@@ -134,7 +134,7 @@ test('数量、时间、地点会在转述里走样，但不会变成事实', ()
 
 test('二手消息还能继续传，但仍然只是信念', () => {
   const { world, victim, witness, listener } = deathScene();
-  const third = agent(world, '老唐');
+  const third = agent(world, '苏禾');
   third.alive = true;
   third.x = 23;
   third.y = 20;

@@ -122,6 +122,54 @@ const ORIGIN_PROFILES = {
   流浪者: { skills: { gather: 3, talk: 2, fight: 2 }, knows: [] },
 };
 
+const LANGUAGES = {
+  north: { label: '北岸话' },
+  south: { label: '南渡话' },
+  outland: { label: '外来话' },
+};
+
+export const LANGUAGE_KEYS = Object.freeze(Object.keys(LANGUAGES));
+
+export const LANGUAGE_LABEL = Object.fromEntries(
+  Object.entries(LANGUAGES).map(([key, value]) => [key, value.label])
+);
+
+const HOMETOWN_LANGUAGE = { 北岸: 'north', 南渡: 'south', 外来: 'outland' };
+
+export const ORIGIN_HOMETOWN = {
+  小城教师: '北岸',
+  农妇: '北岸',
+  铁匠: '北岸',
+  医生: '北岸',
+  渔夫: '南渡',
+  少女: '南渡',
+  木匠: '南渡',
+  猎人: '南渡',
+  青年: '外来',
+  教师: '外来',
+  石匠: '外来',
+  流浪者: '外来',
+};
+
+export function sharedLanguage(a, b) {
+  return Object.keys(a.languages).find((language) => b.languages[language]) || null;
+}
+
+function learnLanguage(agent, language, rate) {
+  if (agent.languages[language]) return true;
+  const progress = Math.min(
+    1,
+    (agent.languageProgress[language] || 0) + rate * growthMultiplier(agent, 'talk')
+  );
+  if (progress >= 1) {
+    agent.languages[language] = true;
+    delete agent.languageProgress[language];
+    return true;
+  }
+  agent.languageProgress[language] = progress;
+  return false;
+}
+
 const APTITUDE_GROWTH = {
   体魄: { fight: 1.6, gather: 1.2, build: 1.1 },
   机敏: { gather: 1.5, fight: 1.1, craft: 1.1 },
@@ -246,6 +294,8 @@ export function createWorld(seed = 20261102) {
     const [x, y] = findGrass(map, ring[i][0], ring[i][1]);
     const skills = { ...BASE_SKILLS, ...(ORIGIN_PROFILES[c.origin]?.skills || {}) };
     const knows = initialKnows(c.origin);
+    const hometown = ORIGIN_HOMETOWN[c.origin] || '北岸';
+    const nativeLanguage = HOMETOWN_LANGUAGE[hometown] || 'north';
     return {
       id: 'a' + (i + 1),
       name: c.name,
@@ -256,10 +306,19 @@ export function createWorld(seed = 20261102) {
       hunger: 70 + Math.floor(buildRng() * 20),
       energy: 80 + Math.floor(buildRng() * 20),
       inventory: { food: 1, wood: 0, stone: 0, weapon: 0 },
-      tags: { origin: c.origin, obsession: c.obsession, aptitude: c.aptitude, wound: c.wound },
+      tags: {
+        origin: c.origin,
+        hometown,
+        obsession: c.obsession,
+        aptitude: c.aptitude,
+        wound: c.wound,
+      },
       skills,
       knows,
       learning: {},
+      nativeLanguage,
+      languages: { [nativeLanguage]: true },
+      languageProgress: {},
       heirId: null,
       heirKind: null,
       mentorId: null,
@@ -491,7 +550,9 @@ function renderClaim(world, claim) {
     return `${subject}打了${target}。`;
   }
   if (claim.kind === 'teach') {
-    return `${subject}教了${nameOf(world, claim.targetId)}${KNOWLEDGE_LABEL[claim.object] || claim.object}。`;
+    const lesson =
+      KNOWLEDGE_LABEL[claim.object] || LANGUAGE_LABEL[claim.object] || claim.object;
+    return `${subject}教了${nameOf(world, claim.targetId)}${lesson}。`;
   }
   return `你听说了一件关于${subject}的事。`;
 }
@@ -531,7 +592,7 @@ function retellBelief(world, speaker, listener) {
 }
 
 function recordTeaching(world, teacher, student, { key, kind, label }) {
-  const completed = kind === 'knowledge';
+  const completed = kind === 'knowledge' || kind === 'language';
   const text = completed
     ? `${teacher.name}教会了${student.name}${label}。`
     : `${teacher.name}教了${student.name}一点${label}。`;
@@ -872,6 +933,20 @@ function correctBeliefs(world, a) {
   }
 }
 
+function learnByProximity(world, a) {
+  for (const other of world.agents) {
+    if (!other.alive || other.id === a.id) continue;
+    if (Math.abs(other.x - a.x) + Math.abs(other.y - a.y) > 1) continue;
+    if (a.languages[other.nativeLanguage]) continue;
+    if (learnLanguage(a, other.nativeLanguage, 0.0004)) {
+      remember(
+        a,
+        `你和${other.name}待久了，听懂了${LANGUAGE_LABEL[other.nativeLanguage]}。`
+      );
+    }
+  }
+}
+
 function stepAgent(world, a) {
   if (!a.alive) return;
 
@@ -909,6 +984,7 @@ function stepAgent(world, a) {
   }
 
   correctBeliefs(world, a);
+  learnByProximity(world, a);
 }
 
 function endAction(world, a, cooldown = 2) {
@@ -1131,36 +1207,55 @@ function runAction(world, a) {
         faceToward(a, target.x, target.y);
         const say = (act.say || '').slice(0, 80);
         a.lastSay = say;
-        const delta = 2 + Math.floor(world.rng() * 4);
+        const shared = sharedLanguage(a, target);
+        const understood = !!shared;
+        const spokenLanguage = shared || a.nativeLanguage;
+        const delta = understood ? 2 + Math.floor(world.rng() * 4) : 1 + Math.floor(world.rng() * 2);
         a.relationships[target.id] = (a.relationships[target.id] || 0) + delta;
         target.relationships[a.id] = (target.relationships[a.id] || 0) + delta;
         growSkill(a, 'talk', 0.04);
-        if ((target.reputation || 0) >= 10 && (a.relationships[target.id] || 0) >= 15) {
-          maybeTurn(world, target, 'leader', `${a.name}把你当成了主心骨。`);
-        }
+
         if (say) {
-          const spoken = logEvent(world, 'talk', `${a.name}对${target.name}说：「${say}」`, a.id);
+          const spoken = logEvent(world, 'talk', `${a.name}对${target.name}说：「${say}」`, a.id, {
+            understood,
+            language: spokenLanguage,
+          });
           recordFact(world, {
             type: 'talk',
             subjectId: a.id,
             predicate: 'said',
             object: say,
             targetId: target.id,
+            language: spokenLanguage,
+            understood,
             eventSeq: spoken.seq,
           });
-          recordBelief(world, target, `${a.name}说：「${say}」`, 'told', 0.6, {
-            kind: 'talk',
-            subjectId: a.id,
-            predicate: 'said',
-            object: say,
-            place: placeName(world, a.x, a.y),
-            time: world.tick,
-          });
-          remember(a, `你对${target.name}说：「${say}」`);
-          remember(target, `${a.name}对你说：「${say}」`);
+
+          if (understood) {
+            recordBelief(world, target, `${a.name}说：「${say}」`, 'told', 0.6, {
+              kind: 'talk',
+              subjectId: a.id,
+              predicate: 'said',
+              object: say,
+              place: placeName(world, a.x, a.y),
+              time: world.tick,
+            });
+            remember(a, `你对${target.name}说：「${say}」`);
+            remember(target, `${a.name}对你说：「${say}」`);
+            if ((target.reputation || 0) >= 10 && (a.relationships[target.id] || 0) >= 15) {
+              maybeTurn(world, target, 'leader', `${a.name}把你当成了主心骨。`);
+            }
+            retellBelief(world, a, target);
+          } else {
+            remember(a, `你对${target.name}说了一句他不明白的话。`);
+            remember(target, `${a.name}对你说了一句听不懂的话。`);
+            if (learnLanguage(target, spokenLanguage, 0.03)) {
+              remember(target, `你听懂了${LANGUAGE_LABEL[spokenLanguage]}。`);
+            }
+          }
+
           emitSound(world, a.x, a.y, 5, 'talk', '有人在说话', a.id);
         }
-        retellBelief(world, a, target);
       }
       break;
     }
@@ -1171,6 +1266,20 @@ function runAction(world, a) {
       if (!target || !adjacent(a, target)) break;
       const key = String(act.skill || '');
       let taught = false;
+
+      if (LANGUAGE_KEYS.includes(key) && a.languages[key] && !target.languages[key]) {
+        const learned = learnLanguage(target, key, 0.34);
+        a.energy = Math.max(0, a.energy - 2);
+        growSkill(a, 'teach', 0.2);
+        taught = true;
+        if (learned) {
+          recordTeaching(world, a, target, { key, kind: 'language', label: LANGUAGE_LABEL[key] });
+        } else {
+          logEvent(world, 'teach', `${a.name}在教${target.name}${LANGUAGE_LABEL[key]}。`, a.id);
+          remember(a, `你在教${target.name}${LANGUAGE_LABEL[key]}。`);
+          remember(target, `${a.name}在教你${LANGUAGE_LABEL[key]}。`);
+        }
+      }
 
       if (KNOWLEDGE_KEYS.includes(key) && a.knows[key] && !target.knows[key]) {
         const progress = Math.min(1, (target.learning[key] || 0) + knowledgeProgressGain(target, key));
@@ -1574,6 +1683,8 @@ function copyAgentForStorage(a, deciding) {
     skills: { ...BASE_SKILLS, ...a.skills },
     knows: { ...emptyKnows(), ...a.knows },
     learning: { ...a.learning },
+    languages: { ...a.languages },
+    languageProgress: { ...a.languageProgress },
     relationships: { ...a.relationships },
     memory: [...a.memory],
     beliefs: (a.beliefs || []).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
@@ -1702,6 +1813,8 @@ export function snapshot(world) {
       skills: { ...a.skills },
       knows: { ...a.knows },
       learning: { ...a.learning },
+      nativeLanguage: a.nativeLanguage,
+      languages: { ...a.languages },
       identity: a.identity,
       turningPoints: a.turningPoints.slice(-5).map((t) => ({ ...t })),
       beliefs: a.beliefs.slice(-10).map((b) => ({ ...b, claim: copyClaim(b.claim) })),

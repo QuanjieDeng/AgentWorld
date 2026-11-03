@@ -10,7 +10,10 @@ import {
   KNOWLEDGE_LABEL,
   SKILL_KEYS,
   SKILL_LABEL,
+  LANGUAGE_KEYS,
+  LANGUAGE_LABEL,
   TURNING_TRIGGERS,
+  sharedLanguage,
   resourceNear,
   isWalkable,
   logDecision,
@@ -20,6 +23,8 @@ import {
 import { visibleAgents, visibleStructures, visibleWolves, heardSounds } from './perception.js';
 
 const DIR_NAMES = { N: '北', S: '南', W: '西', E: '东' };
+
+const TEACHABLE_KEYS = [...new Set([...KNOWLEDGE_KEYS, ...SKILL_KEYS, ...LANGUAGE_KEYS])];
 
 // 脱变带来的行为倾向：aggression 影响动手门槛，talk 影响主动搭话与收养，night 影响夜里的胆量。
 const IDENTITY_TRAITS = {
@@ -282,12 +287,15 @@ export function mockDecide(world, a) {
     const other = nearestAgent(world, a, 2);
     if (other) {
       const missing = KNOWLEDGE_KEYS.find((k) => a.knows[k] && !other.knows[k]);
-      const lesson = missing || SKILL_KEYS.filter((k) => k !== 'teach').find(
+      const missingLanguage = LANGUAGE_KEYS.find((l) => a.languages[l] && !other.languages[l]);
+      const skillCandidate = SKILL_KEYS.filter((k) => k !== 'teach').find(
         (k) => (a.skills[k] || 0) >= 3 && (other.skills[k] || 0) < a.skills[k] - 1
       );
-      if (lesson) {
+      const topic =
+        (!sharedLanguage(a, other) && missingLanguage) || missing || skillCandidate || missingLanguage;
+      if (topic) {
         if (Math.abs(other.x - a.x) + Math.abs(other.y - a.y) <= 1) {
-          return { type: 'teach', target: other.id, skill: lesson, remaining: 1 };
+          return { type: 'teach', target: other.id, skill: topic, remaining: 1 };
         }
         return moveToward(a, other.x, other.y);
       }
@@ -380,6 +388,7 @@ function buildPrompt(world, a) {
   const user = `时间：第${world.day}天 ${world.clock}（${world.isNight ? '夜' : '昼'}）
 你的位置：(${a.x},${a.y})，可走的方向：${canWalk.map((d) => DIR_NAMES[d]).join('、') || '无'}
 状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}
+你说的语言：${LANGUAGE_LABEL[a.nativeLanguage]}；你会的语言：${Object.keys(a.languages).map((l) => LANGUAGE_LABEL[l]).join('、')}
 ${a.mentorId ? `收养你的人：${world.agents.find((x) => x.id === a.mentorId)?.name || '某个人'}` : ''}
 ${a.inheritedObsession ? `你接过了${a.inheritedFrom}没做完的事：${a.inheritedObsession}` : ''}
 ${a.identity ? `你现在的身份：${a.identity}` : ''}
@@ -400,7 +409,7 @@ ${near.water}
 你相信最近发生的事：${a.beliefs.slice(-3).map((b) => b.proposition).join('；') || '没有'}
 ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 
-规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。站在坟旁边可以埋葬死者；埋葬自己收养或收徒的人，会改变你的一生。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
+规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。站在坟旁边可以埋葬死者；埋葬自己收养或收徒的人，会改变你的一生。不同语言的人听不懂彼此说的话；你可以教对方你的语言，也可能在长期接触中慢慢学会对方的语言。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
 
 选择你接下来的行动。只输出一个 JSON：
 {"action":"move","dir":"N|S|E|W","steps":1到8}
@@ -411,7 +420,7 @@ ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 {"action":"craft","reason":"为什么要做"}
 {"action":"build","build":"fire|shelter|wall","reason":"为什么要建"}
 {"action":"talk","target":"名字","say":"一句话"}
-{"action":"teach","target":"名字","skill":"${[...new Set([...KNOWLEDGE_KEYS, ...SKILL_KEYS])].join('|')}","reason":"为什么要教"}
+{"action":"teach","target":"名字","skill":"${TEACHABLE_KEYS.join('|')}","reason":"为什么要教"}
 {"action":"adopt","target":"名字","kind":"adopted|apprentice","reason":"为什么要把身后事交给他"}
 {"action":"moveIn","reason":"为什么要搬进去"}
 {"action":"bury","reason":"为什么要埋葬"}
@@ -487,7 +496,7 @@ function normalize(world, a, raw) {
     if (!t) return null;
     if (Math.abs(t.x - a.x) + Math.abs(t.y - a.y) > 1) return moveToward(a, t.x, t.y);
     const skill = String(obj.skill ?? obj.what ?? '').trim();
-    if (![...KNOWLEDGE_KEYS, ...SKILL_KEYS].includes(skill)) return null;
+    if (!TEACHABLE_KEYS.includes(skill)) return null;
     return { type: 'teach', target: t.id, skill, reason: whyText, remaining: 1 };
   }
   if (action === 'adopt') {
