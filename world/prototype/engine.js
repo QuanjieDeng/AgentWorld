@@ -223,6 +223,9 @@ export function createWorld(seed = 20261102) {
     sounds: [],
     regrow: [],
     remains: [],
+    chronicle: [],
+    nextChronicleId: 1,
+    pendingTurnings: [],
     pendingDecisions: [],
     rng: mulberry32(seed ^ 0x9e3779b9),
     config: { paused: false, speed: 1, llmAgents: 0, distortionChance: DEFAULT_DISTORTION },
@@ -262,6 +265,9 @@ export function createWorld(seed = 20261102) {
       mentorId: null,
       inheritedObsession: null,
       inheritedFrom: null,
+      identity: null,
+      turningPoints: [],
+      maxTurnings: 2 + Math.floor(buildRng() * 4),
       reputation: 0,
       relationships: {},
       memory: [],
@@ -400,6 +406,15 @@ const PLACES = ['水边', '营地', '树林', '废墟', '空地'];
 const BUILD_NAMES = { fire: '火堆', shelter: '窝棚', wall: '墙' };
 
 const HEIR_KINDS = { adopted: '养子', apprentice: '徒弟' };
+
+export const TURNING_TRIGGERS = {
+  killed: { labels: ['手上带血的人', '复仇者', '幸存者'] },
+  enemy_died: { labels: ['释怀的人', '空下来的人'] },
+  kin_died: { labels: ['守墓人', '断后的人'] },
+  betrayed: { labels: ['独行者', '不再相信人的人'] },
+  leader: { labels: ['首领', '被追随的人'] },
+  hunted: { labels: ['猎手', '不怕夜的人'] },
+};
 
 function nameOf(world, id) {
   return world.agents.find((a) => a.id === id)?.name || '某个人';
@@ -586,6 +601,7 @@ function describeAction(act) {
     case 'teach': return '教人东西';
     case 'adopt': return '收养或收徒';
     case 'moveIn': return '搬进去或收下遗产';
+    case 'bury': return '埋葬死者';
     case 'attack': return '攻击';
     case 'flee': return '逃跑';
     case 'rest': return '休息';
@@ -629,7 +645,14 @@ export function kill(world, a, cause, killerId = null) {
   a.hp = 0;
   a.action = null;
   a.queuedAction = null;
-  world.structures.push({ type: 'grave', x: a.x, y: a.y, name: a.name });
+  world.structures.push({
+    type: 'grave',
+    x: a.x,
+    y: a.y,
+    name: a.name,
+    agentId: a.id,
+    buried: false,
+  });
   const claim = {
     kind: 'death',
     subjectId: a.id,
@@ -667,9 +690,94 @@ export function kill(world, a, cause, killerId = null) {
     if (other.alive && other.id !== a.id && Math.abs(other.x - a.x) + Math.abs(other.y - a.y) <= 5) {
       remember(other, `${a.name}死了。${cause}`);
       recordBelief(world, other, renderClaim(world, claim), 'witness', 0.9, claim);
+
+      if ((other.relationships[a.id] || 0) < -15 || (a.relationships[other.id] || 0) < -15) {
+        maybeTurn(world, other, 'enemy_died', `你恨的${a.name}死了。`);
+      }
     }
   }
+
+  if (killerId) {
+    const killer = world.agents.find((agent) => agent.id === killerId && agent.alive);
+    if (killer) maybeTurn(world, killer, 'killed', `你杀死了${a.name}，并且活了下来。`);
+  }
+
   resolveInheritance(world, a);
+}
+
+export function turningFallbackLabel(world, trigger) {
+  const labels = TURNING_TRIGGERS[trigger]?.labels || ['幸存者'];
+  return labels[Math.floor(world.rng() * labels.length)];
+}
+
+function canTurn(agent, trigger) {
+  return (
+    !!TURNING_TRIGGERS[trigger] &&
+    agent.alive &&
+    agent.turningPoints.length < agent.maxTurnings &&
+    !agent.turningPoints.some((t) => t.trigger === trigger)
+  );
+}
+
+export function applyTurning(world, agent, trigger, label, reason) {
+  const definition = TURNING_TRIGGERS[trigger];
+  if (!definition || !canTurn(agent, trigger)) return null;
+
+  const chosen = definition.labels.includes(label) ? label : definition.labels[0];
+  const turning = Object.freeze({
+    t: world.tick,
+    day: world.day || 1,
+    trigger,
+    label: chosen,
+    reason,
+    x: agent.x,
+    y: agent.y,
+  });
+  agent.turningPoints.push(turning);
+  agent.identity = chosen;
+  agent.reputation += 5;
+
+  const event = logEvent(world, 'turning', `${agent.name}脱变成了${chosen}。${reason}`, agent.id, {
+    trigger,
+    label: chosen,
+  });
+  recordFact(world, {
+    type: 'turning',
+    subjectId: agent.id,
+    predicate: 'became',
+    object: chosen,
+    trigger,
+    reason,
+    x: agent.x,
+    y: agent.y,
+    eventSeq: event.seq,
+  });
+  recordBelief(world, agent, `你成了${chosen}。${reason}`, 'self', 1);
+  world.chronicle.push(
+    Object.freeze({
+      id: `c${world.nextChronicleId++}`,
+      t: world.tick,
+      day: world.day || 1,
+      kind: 'turning',
+      agentId: agent.id,
+      label: chosen,
+      trigger,
+      reason,
+      x: agent.x,
+      y: agent.y,
+    })
+  );
+  return turning;
+}
+
+export function maybeTurn(world, agent, trigger, reason) {
+  if (!agent || !canTurn(agent, trigger)) return null;
+
+  if (world.api.key && agent.useLLM && !world.ruleOnly) {
+    world.pendingTurnings.push({ agentId: agent.id, trigger, reason });
+    return null;
+  }
+  return applyTurning(world, agent, trigger, turningFallbackLabel(world, trigger), reason);
 }
 
 function transferItems(items, inventory) {
@@ -1027,6 +1135,9 @@ function runAction(world, a) {
         a.relationships[target.id] = (a.relationships[target.id] || 0) + delta;
         target.relationships[a.id] = (target.relationships[a.id] || 0) + delta;
         growSkill(a, 'talk', 0.04);
+        if ((target.reputation || 0) >= 10 && (a.relationships[target.id] || 0) >= 15) {
+          maybeTurn(world, target, 'leader', `${a.name}把你当成了主心骨。`);
+        }
         if (say) {
           const spoken = logEvent(world, 'talk', `${a.name}对${target.name}说：「${say}」`, a.id);
           recordFact(world, {
@@ -1131,6 +1242,41 @@ function runAction(world, a) {
       break;
     }
 
+    case 'bury': {
+      if (act.remaining > 0) break;
+      const grave = world.structures.find(
+        (s) =>
+          s.type === 'grave' &&
+          !s.buried &&
+          Math.abs(s.x - a.x) + Math.abs(s.y - a.y) <= 1
+      );
+      if (!grave) {
+        remember(a, '这里没有需要埋葬的人。');
+        break;
+      }
+      grave.buried = true;
+      const dead = world.agents.find((agent) => agent.id === grave.agentId);
+      const kin =
+        dead &&
+        (a.heirId === dead.id ||
+          a.mentorId === dead.id ||
+          dead.heirId === a.id ||
+          dead.mentorId === a.id);
+
+      logEvent(world, 'bury', `${a.name}埋葬了${grave.name}。`, a.id, { deadId: grave.agentId });
+      recordFact(world, {
+        type: 'bury',
+        subjectId: a.id,
+        predicate: 'buried',
+        object: grave.agentId || grave.name,
+        x: grave.x,
+        y: grave.y,
+      });
+      remember(a, `你埋葬了${grave.name}。`);
+      if (kin) maybeTurn(world, a, 'kin_died', `你亲手埋葬了${grave.name}。`);
+      break;
+    }
+
     case 'moveIn': {
       if (act.remaining > 0) break;
       let moved = false;
@@ -1208,6 +1354,7 @@ function runAction(world, a) {
               eventSeq: slain.seq,
             });
             remember(a, '你杀死了一头野兽。');
+            maybeTurn(world, a, 'hunted', '你杀死了一头野兽，并且活了下来。');
           }
         }
         break;
@@ -1218,6 +1365,9 @@ function runAction(world, a) {
         faceToward(a, target.x, target.y);
         const atk = 8 + a.skills.fight * 2 + a.inventory.weapon * 5 + Math.floor(world.rng() * 5);
         const def = target.skills.fight + target.inventory.weapon * 3 + (structureAt(world, target.x, target.y)?.type === 'shelter' ? 3 : 0);
+        if ((target.relationships[a.id] || 0) >= 15) {
+          maybeTurn(world, target, 'betrayed', `${a.name}对你动了手，而你信任他。`);
+        }
         const dmg = Math.max(2, atk - def);
         damage(world, target, dmg, a);
         growSkill(a, 'fight', 0.05);
@@ -1427,6 +1577,7 @@ function copyAgentForStorage(a, deciding) {
     relationships: { ...a.relationships },
     memory: [...a.memory],
     beliefs: (a.beliefs || []).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
+    turningPoints: (a.turningPoints || []).map((t) => Object.freeze({ ...t })),
     trace: a.trace.map((t) => ({ ...t })),
     action: a.action ? { ...a.action } : null,
     queuedAction: a.queuedAction ? { ...a.queuedAction } : null,
@@ -1450,6 +1601,8 @@ export function serializeWorld(world) {
     structures: world.structures.map((s) => ({ ...s })),
     wolves: world.wolves.map((w) => ({ ...w })),
     remains: world.remains.map(copyRemains),
+    chronicle: world.chronicle.map((c) => ({ ...c })),
+    nextChronicleId: world.nextChronicleId,
     log: world.log.map(copyEvent),
     eventLog: world.eventLog.map(copyEvent),
     facts: world.facts.map((f) => ({ ...f })),
@@ -1486,6 +1639,9 @@ export function loadWorld(data) {
     structures: data.structures.map((s) => ({ ...s })),
     wolves: data.wolves.map((w) => ({ ...w })),
     remains: (data.remains || []).map(copyRemains),
+    chronicle: (data.chronicle || []).map((c) => Object.freeze({ ...c })),
+    nextChronicleId: data.nextChronicleId || 1,
+    pendingTurnings: [],
     log: data.log.map(copyEvent),
     eventLog: data.eventLog.map(copyEvent),
     facts: (data.facts || []).map((f) => ({ ...f })),
@@ -1546,6 +1702,8 @@ export function snapshot(world) {
       skills: { ...a.skills },
       knows: { ...a.knows },
       learning: { ...a.learning },
+      identity: a.identity,
+      turningPoints: a.turningPoints.slice(-5).map((t) => ({ ...t })),
       beliefs: a.beliefs.slice(-10).map((b) => ({ ...b, claim: copyClaim(b.claim) })),
       memory: a.memory.slice(-20),
       letter: a.letter,
@@ -1562,6 +1720,7 @@ export function snapshot(world) {
       vacant: s.type === 'shelter' && !s.ownerId,
     })),
     remains: world.remains.slice(-10).map(copyRemains),
+    chronicle: world.chronicle.slice(-20).map((c) => ({ ...c })),
     wolves: world.wolves.map((w) => ({ id: w.id, x: w.x, y: w.y, hp: w.hp })),
     log: world.log.slice(-40),
     facts: world.facts.slice(-20).map((f) => ({ ...f })),

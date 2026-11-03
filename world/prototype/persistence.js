@@ -4,7 +4,7 @@
 import { createWorld, tick, replayDecisions, MS_PER_TICK, TICKS_PER_DAY } from './engine.js';
 import { processBrains } from './brain.js';
 
-const KEY_EVENT_TYPES = new Set(['death', 'build', 'fight', 'collapse', 'fire', 'letter']);
+const KEY_EVENT_TYPES = new Set(['death', 'build', 'fight', 'collapse', 'fire', 'letter', 'turning']);
 
 export function stepWorld(world, ticks) {
   for (let i = 0; i < ticks; i++) {

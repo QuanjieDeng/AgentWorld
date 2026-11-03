@@ -10,13 +10,35 @@ import {
   KNOWLEDGE_LABEL,
   SKILL_KEYS,
   SKILL_LABEL,
+  TURNING_TRIGGERS,
   resourceNear,
   isWalkable,
   logDecision,
+  applyTurning,
+  turningFallbackLabel,
 } from './engine.js';
 import { visibleAgents, visibleStructures, visibleWolves, heardSounds } from './perception.js';
 
 const DIR_NAMES = { N: '北', S: '南', W: '西', E: '东' };
+
+// 脱变带来的行为倾向：aggression 影响动手门槛，talk 影响主动搭话与收养，night 影响夜里的胆量。
+const IDENTITY_TRAITS = {
+  手上带血的人: { aggression: 1, talk: -0.3 },
+  复仇者: { aggression: 1, talk: -0.3 },
+  幸存者: { aggression: -0.3 },
+  释怀的人: { aggression: -0.5 },
+  空下来的人: { talk: -0.4 },
+  守墓人: { talk: -0.5 },
+  断后的人: { talk: -0.4 },
+  独行者: { talk: -1.2 },
+  不再相信人的人: { talk: -1.2 },
+  首领: { aggression: 0.5, talk: 0.3 },
+  被追随的人: { aggression: 0.3, talk: 0.5 },
+  猎手: { aggression: 0.6, night: true },
+  不怕夜的人: { night: true },
+};
+
+const traitsOf = (agent) => IDENTITY_TRAITS[agent.identity] || {};
 
 function dirTo(a, x, y) {
   const dx = x - a.x;
@@ -106,17 +128,20 @@ function mockSay(world, a, other) {
 // ---------- 规则大脑（离线可用） ----------
 
 export function mockDecide(world, a) {
+  const traits = traitsOf(a);
   if (a.hunger < 32 && a.inventory.food > 0) return { type: 'eat', remaining: 1 };
 
   const wolf = world.wolves.find((w) => Math.abs(w.x - a.x) + Math.abs(w.y - a.y) <= 1);
   if (wolf) {
-    if (a.hp > 45 || a.inventory.weapon) return { type: 'attack', target: 'wolf', reason: '它要咬我', remaining: 2 };
+    const brave = a.hp > (traits.night ? 25 : 45) || a.inventory.weapon;
+    if (brave) return { type: 'attack', target: 'wolf', reason: '它要咬我', remaining: 2 };
     return fleeAction();
   }
 
   const hostile = nearestAgent(world, a, 1, (o) => (a.relationships[o.id] || 0) < -20);
   if (hostile) {
-    if (a.hp > 50 && a.skills.fight >= 2) return { type: 'attack', target: hostile.id, reason: '上一次的仇还没算', remaining: 2 };
+    const ready = a.hp > 50 - (traits.aggression || 0) * 15;
+    if (ready && a.skills.fight >= 2) return { type: 'attack', target: hostile.id, reason: '上一次的仇还没算', remaining: 2 };
     return fleeAction();
   }
 
@@ -175,6 +200,26 @@ export function mockDecide(world, a) {
 
   if (a.energy < 22) return { type: 'rest', remaining: 30 };
 
+  // 亲手埋葬自己的继承人/收养人，是这一生少数几个真正的转折。
+  const kinGrave = world.structures.find((s) => {
+    if (s.type !== 'grave' || s.buried) return false;
+    const dead = world.agents.find((x) => x.id === s.agentId);
+    return (
+      dead &&
+      (dead.heirId === a.id ||
+        dead.mentorId === a.id ||
+        a.heirId === dead.id ||
+        a.mentorId === dead.id)
+    );
+  });
+  if (kinGrave) {
+    const d = Math.abs(kinGrave.x - a.x) + Math.abs(kinGrave.y - a.y);
+    if (d <= 6) {
+      if (d <= 1) return { type: 'bury', remaining: 1 };
+      return moveToward(a, kinGrave.x, kinGrave.y);
+    }
+  }
+
   // 手边有资源就采
   const nearRes = resourceNear(world, a, [TILE.TREE, TILE.BUSH, TILE.ROCK]);
   if (nearRes) return { type: 'gather', remaining: 6 };
@@ -209,7 +254,8 @@ export function mockDecide(world, a) {
   }
 
   // 没有继承人时，遇到足够亲近的人就收养或收徒。
-  if (!a.heirId && world.rng() < 0.05) {
+  const adoptChance = Math.max(0, 0.05 + (traits.talk || 0) * 0.02);
+  if (!a.heirId && adoptChance > 0 && world.rng() < adoptChance) {
     const close = nearestAgent(world, a, 2, (o) => (a.relationships[o.id] || 0) >= 15);
     if (close) {
       if (Math.abs(close.x - a.x) + Math.abs(close.y - a.y) <= 1) {
@@ -248,7 +294,8 @@ export function mockDecide(world, a) {
     }
   }
 
-  if (a.inventory.food > 0 && world.rng() < 0.18) {
+  const talkChance = Math.max(0, 0.18 + (traits.talk || 0) * 0.15);
+  if (talkChance > 0 && a.inventory.food > 0 && world.rng() < talkChance) {
     const other = nearestAgent(world, a, 3);
     if (other) return { type: 'talk', target: other.id, say: mockSay(world, a, other), remaining: 2 };
   }
@@ -335,6 +382,7 @@ function buildPrompt(world, a) {
 状态：生命${Math.round(a.hp)}，饥饿${Math.round(a.hunger)}，体力${Math.round(a.energy)}
 ${a.mentorId ? `收养你的人：${world.agents.find((x) => x.id === a.mentorId)?.name || '某个人'}` : ''}
 ${a.inheritedObsession ? `你接过了${a.inheritedFrom}没做完的事：${a.inheritedObsession}` : ''}
+${a.identity ? `你现在的身份：${a.identity}` : ''}
 你刚才：${a.lastAction || '刚醒来'}
 背包：食物${a.inventory.food}，木头${a.inventory.wood}，石头${a.inventory.stone}，${a.inventory.weapon ? '有武器' : '赤手空拳'}
 你会：${Object.entries(a.skills).filter(([, v]) => v > 0).map(([k, v]) => `${SKILL_LABEL[k] || k}${v.toFixed(1)}`).join('、')}
@@ -352,7 +400,7 @@ ${near.water}
 你相信最近发生的事：${a.beliefs.slice(-3).map((b) => b.proposition).join('；') || '没有'}
 ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 
-规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
+规则：一次移动默认走多格（steps 1-8）；采集要站在资源旁边（1 格）；交谈、教导、收养和攻击要与对方相邻（1 格），如果对方不在旁边，就先朝他的方向移动；建火堆需 5 木头，窝棚需 10 木头，墙需 5 石头；吃东西需要背包里有食物。生火、窝棚、墙、捕鱼、耕种、削武器都是岛上独有的知识，不会就做不成；你可以在相邻时把你会而对方不会的东西教给他。把一个人收作继承人（收养或收徒），你死后他会得到你的东西、部分技能、知识和信念；关系要足够亲近。没有人继承的遗产和空宅可以搬进去。站在坟旁边可以埋葬死者；埋葬自己收养或收徒的人，会改变你的一生。饥饿会持续下降，归零就会死，所以先保证有食物；体力归零也会持续掉血，必须休息。水边的鱼是无限的，站在水边可以捕鱼；花 1 份食物可以在草地上种一丛灌木，两天后长出来；树和灌木被采完后要很久才能长回来。天黑以后野兽会出现，待在有火的地方更安全。攻击必须有真实的理由（饥饿、仇恨、恐惧、被挑衅），不能无缘无故。重要的行动（建造、制造、逃离、耕种）都写一句 reason，它会留在你的人生记录里。
 
 选择你接下来的行动。只输出一个 JSON：
 {"action":"move","dir":"N|S|E|W","steps":1到8}
@@ -366,6 +414,7 @@ ${a.letter ? `你听见一个声音说：「${a.letter}」` : ''}
 {"action":"teach","target":"名字","skill":"${[...new Set([...KNOWLEDGE_KEYS, ...SKILL_KEYS])].join('|')}","reason":"为什么要教"}
 {"action":"adopt","target":"名字","kind":"adopted|apprentice","reason":"为什么要把身后事交给他"}
 {"action":"moveIn","reason":"为什么要搬进去"}
+{"action":"bury","reason":"为什么要埋葬"}
 {"action":"attack","target":"名字或野兽","reason":"为什么动手"}
 {"action":"flee","reason":"为什么要逃"}
 {"action":"rest"}
@@ -391,7 +440,7 @@ function normalize(world, a, raw) {
   if (!obj || typeof obj !== 'object') return null;
 
   const whyText = String(obj.reason || obj.why || '').slice(0, 60);
-  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'adopt', 'moveIn', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
+  const ACTIONS = ['move', 'gather', 'eat', 'craft', 'build', 'talk', 'teach', 'adopt', 'moveIn', 'bury', 'attack', 'flee', 'rest', 'idle', 'fish', 'plant'];
   const action = ACTIONS.includes(obj.action) ? obj.action : ACTIONS.includes(obj.type) ? obj.type : null;
 
   if (action === 'move') {
@@ -455,6 +504,7 @@ function normalize(world, a, raw) {
     };
   }
   if (action === 'moveIn') return { type: 'moveIn', reason: whyText, remaining: 1 };
+  if (action === 'bury') return { type: 'bury', reason: whyText, remaining: 1 };
   if (action === 'attack') {
     const t = String(obj.target ?? obj.to ?? obj.name ?? '');
     const reason = String(obj.reason || obj.why || '').slice(0, 60);
@@ -494,8 +544,7 @@ function endpoint(base, provider) {
   return `${b}/chat/completions`;
 }
 
-async function llmDecide(world, a) {
-  const { sys, user } = buildPrompt(world, a);
+async function requestLLM(world, sys, user) {
   const anthropic = world.api.provider === 'anthropic';
   const url = endpoint(world.api.base, world.api.provider);
 
@@ -535,11 +584,31 @@ async function llmDecide(world, a) {
 
   if (!res.ok) throw new Error(`LLM ${res.status}`);
   const data = await res.json();
-  const text = anthropic
+  return anthropic
     ? (data?.content || []).filter((c) => c.type === 'text').map((c) => c.text).join('')
     : data?.choices?.[0]?.message?.content || '';
+}
 
-  return normalize(world, a, text);
+async function llmDecide(world, a) {
+  const { sys, user } = buildPrompt(world, a);
+  return normalize(world, a, await requestLLM(world, sys, user));
+}
+
+async function llmTurning(world, a, proposal) {
+  const definition = TURNING_TRIGGERS[proposal.trigger];
+  if (!definition) return null;
+  const sys = `你叫${a.name}。你刚经历了一件改变你的事。你只能从给定的身份里选一个。只输出一个 JSON，不要解释，不要代码块。`;
+  const user = `发生了什么：${proposal.reason}
+可选的身份：${definition.labels.join('、')}
+输出：{"label":"选中的身份"}`;
+  const text = await requestLLM(world, sys, user);
+  const match = text.match(/\{[\s\S]*\}/);
+  if (!match) return null;
+  try {
+    return String(JSON.parse(match[0]).label || '');
+  } catch {
+    return null;
+  }
 }
 
 // ---------- 调度 ----------
@@ -574,6 +643,45 @@ function applyReplayDecisions(world) {
 }
 
 export function processBrains(world) {
+  if (world.pendingTurnings?.length) {
+    const pending = world.pendingTurnings;
+    world.pendingTurnings = [];
+    for (const proposal of pending) {
+      const a = world.agents.find((x) => x.id === proposal.agentId);
+      if (!a || !a.alive) continue;
+
+      if (!world.api.key || !a.useLLM || world.ruleOnly || world.inflight >= 6) {
+        applyTurning(
+          world,
+          a,
+          proposal.trigger,
+          turningFallbackLabel(world, proposal.trigger),
+          proposal.reason
+        );
+        continue;
+      }
+
+      world.inflight++;
+      world.llmCalls = (world.llmCalls || 0) + 1;
+      llmTurning(world, a, proposal)
+        .then((label) => applyTurning(world, a, proposal.trigger, label, proposal.reason))
+        .catch((err) => {
+          world.llmErrors = (world.llmErrors || 0) + 1;
+          world.llmLastError = String(err?.message || err);
+          applyTurning(
+            world,
+            a,
+            proposal.trigger,
+            turningFallbackLabel(world, proposal.trigger),
+            proposal.reason
+          );
+        })
+        .finally(() => {
+          world.inflight--;
+        });
+    }
+  }
+
   if (world.replay) {
     applyReplayDecisions(world);
     return;
