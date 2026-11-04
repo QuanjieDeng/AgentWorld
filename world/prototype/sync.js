@@ -18,10 +18,12 @@ import {
   serializeWorld,
   loadWorld,
   applyTurning,
+  flushReplayTerms,
 } from './engine.js';
 import { processBrains } from './brain.js';
 
 export const SYNC_PROTOCOL = 'island-journal/1';
+export const TERM_EVENT = 'term';
 
 // ---------- 规范化与哈希 ----------
 
@@ -81,6 +83,51 @@ export function turningsFromEvents(events) {
       label: e.payload.label,
       reason: e.payload.reason || '',
     }));
+}
+
+// 交接记录必须原样进重放（含 seq / t / day / clock / text），
+// 否则重放出来的事件哈希和对方对不上。
+export function termRecordsFromEvents(events) {
+  return events
+    .filter((e) => e.type === TERM_EVENT && Number.isInteger(e.payload?.term) && e.payload?.authorityId)
+    .map((e) => canonicalEvent(e));
+}
+
+/**
+ * 从日志解出当前任期与日志权威。排序只看日志字段，不看墙钟：
+ *   - 没有 term 事件时，按事件数轮换：term = floor(序号 / TERM_EVENTS)；
+ *   - 有 term 事件时，最后一次交接记录优先，直到事件数轮换追上它。
+ * nodes 必须是所有节点一致的有序名单（server.js 里已排序）。
+ */
+export function resolveTerm(events, { nodes = [], termEvents = 200 } = {}) {
+  const count = events.length;
+  const lastSeq = count ? events[count - 1].seq : 0;
+  const baseTerm = Math.floor(lastSeq / Math.max(1, termEvents));
+
+  let recorded = null;
+  for (let i = count - 1; i >= 0; i--) {
+    const e = events[i];
+    if (e.type === TERM_EVENT && Number.isInteger(e.payload?.term) && e.payload?.authorityId) {
+      recorded = e.payload;
+      break;
+    }
+  }
+
+  if (!recorded || baseTerm > recorded.term) {
+    return {
+      term: baseTerm,
+      authorityId: nodes.length ? nodes[((baseTerm % nodes.length) + nodes.length) % nodes.length] : null,
+      baseTerm,
+      source: 'rotation',
+    };
+  }
+
+  return {
+    term: recorded.term,
+    authorityId: recorded.authorityId,
+    baseTerm,
+    source: 'terms',
+  };
 }
 
 // 状态哈希：只包含会影响下一步模拟的状态。
@@ -237,6 +284,8 @@ function applyRecordedTurnings(world, turnings) {
 
 function clearReplay(world) {
   // 重放模式结束后必须关掉，否则这个世界的居民再也不会做新决定。
+  // 日志末尾可能还剩没有后续事件触发的交接记录，收尾时补进日志。
+  flushReplayTerms(world);
   world.replay = null;
   world.pendingDecisions = [];
   return world;
@@ -256,8 +305,9 @@ export function rebuildFromJournal(envelope, { until = envelope.toTick } = {}) {
   const target = Math.max(0, Math.floor(until));
   const decisions = envelope.decisions.filter((d) => d.tick <= target);
   const turnings = turningsFromEvents(envelope.events).filter((t) => t.t <= target);
+  const terms = termRecordsFromEvents(envelope.events).filter((e) => e.t <= target);
   const world = createWorld(envelope.seed);
-  replayDecisions(world, decisions, turnings);
+  replayDecisions(world, decisions, turnings, terms);
   while (world.tick < target) {
     tick(world);
     processBrains(world);
@@ -309,7 +359,8 @@ export function applyChunk(localWorld, chunk) {
   const world = cloneWorld(localWorld);
   const decisions = chunk.decisions.filter((d) => d.seq >= nextSeq && d.tick <= chunk.toTick);
   const turnings = turningsFromEvents(chunk.events).filter((t) => t.t <= chunk.toTick);
-  replayDecisions(world, decisions, turnings);
+  const terms = termRecordsFromEvents(chunk.events).filter((e) => e.t <= chunk.toTick);
+  replayDecisions(world, decisions, turnings, terms);
   if (decisions.some((d) => d.tick <= localWorld.tick)) processBrains(world);
   while (world.tick < chunk.toTick) {
     tick(world);

@@ -1,5 +1,6 @@
 // server.js — 零依赖本地守护进程 + 网页看板。
-// B 阶段当前只支持单主 → 镜像的 HTTP 日志同步，暂不做 P2P / 双主排序。
+// B 阶段主路径：全节点（SYNC_MODE=peer）双向拉日志、按事件数轮换权威；
+// 权威失联时由轮值里的下一个节点按租约到期接任。单主 → 镜像只作演示/回归。
 
 import http from 'node:http';
 import fs from 'node:fs';
@@ -13,12 +14,21 @@ import {
   loadWorld,
   deliverLetter,
   letterCooldownLeft,
+  logTermEvent,
   MS_PER_TICK,
 } from './engine.js';
 import { advanceOffline, stepWorld } from './persistence.js';
 import { narrate, defaultNarrator, daySummaries } from './chronicle.js';
 import { requestLLM } from './brain.js';
-import { exportJournal, verifyJournal, applyChunk, eventsHash, stateHash } from './sync.js';
+import {
+  exportJournal,
+  verifyJournal,
+  applyChunk,
+  rebuildFromJournal,
+  eventsHash,
+  stateHash,
+  resolveTerm,
+} from './sync.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -48,6 +58,13 @@ const HANDOFF_SETTLE_MS = Math.max(0, Number(process.env.HANDOFF_SETTLE_MS) || 5
 const SYNC_INTERVAL_MS = Math.max(100, Number(process.env.SYNC_INTERVAL_MS) || 2000);
 const SAVE_INTERVAL_MS = Math.max(500, Number(process.env.SAVE_INTERVAL_MS) || 10_000);
 const SPEED = Math.max(1, Math.min(8, Number(process.env.SPEED) || 1));
+// 租约：权威失联多久算“过期”，交给轮值里的下一个节点。
+// 下一任等待 1×TAKEOVER_MS，再下一个 2×，给更近的节点先接手的窗口。
+const LEASE_MS = Math.max(200, Number(process.env.LEASE_MS) || 6000);
+const TAKEOVER_MS = Math.max(
+  LEASE_MS * 2,
+  Number(process.env.TAKEOVER_MS) || LEASE_MS * 2
+);
 
 function loadOrCreate() {
   if (!fs.existsSync(SAVE)) return createWorld(SEED);
@@ -80,19 +97,45 @@ let syncing = false;
 let syncFault = '';
 let handoffReady = false;
 let handoffStart = 0;
+let lastAuthorityId = null;
+let lastTakeoverAt = 0;
+let sawSelfAuthority = false;
 
-// 轮值日志权威：term 由已产生的事件数决定，所有节点从同一条日志算出同一个排序。
-function currentTerm(seq = world.nextSeq) {
-  return Math.floor(Math.max(0, seq - 1) / TERM_EVENTS);
+const startupAt = Date.now();
+// 每个已知节点的最后一次真实接触（拉身份成功，或对方来写日志）。
+// 墙钟只用来判断“失联多久”，不参与排序；排序只看日志里的 term / seq。
+const nodeLastSeen = new Map(NODES.map((id) => [id, startupAt]));
+const peerHealth = new Map(); // url -> { nodeId, lastSeenAt, term, events, error }
+
+// 轮值日志权威：term 优先取日志里最后一次交接记录，其次由事件数轮换。
+// 所有节点从同一条日志算出同一个排序。
+function termState() {
+  return resolveTerm(world.eventLog, { nodes: NODES, termEvents: TERM_EVENTS });
 }
 
-function authorityFor(term = currentTerm()) {
+function currentTerm() {
+  return termState().term;
+}
+
+function authorityFor() {
   if (!PEER) return NODE_ID;
-  return NODES[((term % NODES.length) + NODES.length) % NODES.length];
+  return termState().authorityId;
 }
 
 function isAuthority() {
   return !PEER || authorityFor() === NODE_ID;
+}
+
+// 从当前权威往后数，本节点排第几个。越靠前越早接手。
+function takeoverOffset(authorityId, nodeId = NODE_ID) {
+  const from = NODES.indexOf(authorityId);
+  const to = NODES.indexOf(nodeId);
+  if (from < 0 || to < 0 || NODES.length === 0) return NODES.length || 1;
+  return ((to - from) + NODES.length) % NODES.length || 1;
+}
+
+function noteNodeSeen(nodeId, at = Date.now()) {
+  if (nodeId) nodeLastSeen.set(nodeId, at);
 }
 
 function canWriteLocally() {
@@ -142,6 +185,13 @@ const MIME = {
 function json(res, obj, status = 200) {
   res.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   res.end(JSON.stringify(obj));
+}
+
+function tokenOk(req) {
+  if (!SYNC_TOKEN) return false;
+  const supplied = Buffer.from(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
+  const expected = Buffer.from(SYNC_TOKEN);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
 function readBody(req) {
@@ -232,6 +282,12 @@ async function handleApi(req, res, url) {
 
   // 身份与当前状态哈希：两台机器互相对账用。
   if (url.pathname === '/api/identity') {
+    const now = Date.now();
+    const state = termState();
+    const selfAuthority = state.authorityId === NODE_ID;
+    const authorityLastSeenAt = selfAuthority ? now : nodeLastSeen.get(state.authorityId) || 0;
+    const silentFor = Math.max(0, now - authorityLastSeenAt);
+    const offset = takeoverOffset(state.authorityId);
     return json(res, {
       nodeId: NODE_ID,
       seed: world.seed,
@@ -246,16 +302,36 @@ async function handleApi(req, res, url) {
       peer: PEER_URL || null,
       peers: PEERS,
       role: PEER ? (isAuthority() ? 'authority' : 'follower') : MIRROR ? 'mirror' : 'standalone',
-      term: PEER ? currentTerm() : null,
+      term: PEER ? state.term : null,
+      termSource: PEER ? state.source : null,
       termEvents: PEER ? TERM_EVENTS : null,
       nodes: PEER ? NODES : [],
-      authorityId: PEER ? authorityFor() : null,
+      authorityId: PEER ? state.authorityId : null,
+      successorId: PEER && NODES.length ? NODES[(NODES.indexOf(state.authorityId) + 1 + NODES.length) % NODES.length] : null,
       handoffReady: PEER ? handoffReady : null,
-      syncFault: syncFault || null,
       canWrite: canWriteLocally(),
+      deputized: PEER ? lastTakeoverAt > 0 : null,
+      deposed: PEER ? sawSelfAuthority && !isAuthority() : null,
+      leaseMs: PEER ? LEASE_MS : null,
+      takeoverMs: PEER ? TAKEOVER_MS : null,
+      leaseExpired: PEER && !selfAuthority ? silentFor >= LEASE_MS : false,
+      authorityLastSeenAgoMs: PEER && !selfAuthority ? silentFor : 0,
+      takeoverEtaMs: PEER && !selfAuthority ? Math.max(0, TAKEOVER_MS * offset - silentFor) : null,
+      lastTakeoverAt: PEER && lastTakeoverAt ? lastTakeoverAt : null,
+      syncFault: syncFault || null,
       lastSyncAt: lastSyncAt || null,
       lastSyncedTick,
       lastSyncError,
+      peerHealth: PEER
+        ? [...peerHealth.entries()].map(([url, health]) => ({
+            url,
+            nodeId: health.nodeId,
+            lastSeenAgoMs: Math.max(0, now - health.lastSeenAt),
+            term: health.term,
+            events: health.events,
+            error: health.error || '',
+          }))
+        : [],
     });
   }
 
@@ -273,11 +349,10 @@ async function handleApi(req, res, url) {
     if (!SYNC_TOKEN) {
       return json(res, { ok: false, error: 'SYNC_TOKEN is required for journal apply' }, 503);
     }
-    const supplied = Buffer.from(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
-    const expected = Buffer.from(SYNC_TOKEN);
-    if (supplied.length !== expected.length || !timingSafeEqual(supplied, expected)) {
+    if (!tokenOk(req)) {
       return json(res, { ok: false, error: 'unauthorized' }, 401);
     }
+    if (body.nodeId && body.nodeId !== NODE_ID) noteNodeSeen(body.nodeId);
     const result = applyChunk(world, body);
     if (!result.ok) return json(res, { ok: false, ...result }, 400);
     if (!result.matched) {
@@ -322,6 +397,54 @@ async function handleApi(req, res, url) {
       journalStateHash: body.stateHash,
       matched: seedMatch && covers ? localStateHash === body.stateHash : null,
     });
+  }
+
+  // 分叉的人工出口：由人明确指定一个对端的完整日志作为基准，重建本地世界。
+  // 这是唯一会丢掉本地未同步尾巴的操作，所以只接受显式调用与 token。
+  if (url.pathname === '/api/sync/adopt') {
+    if (!PEER) return json(res, { ok: false, error: 'peer mode only' }, 403);
+    if (!SYNC_TOKEN) return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    if (!tokenOk(req)) return json(res, { ok: false, error: 'unauthorized' }, 401);
+
+    const peer = String(body.peer || '').trim().replace(/\/+$/, '');
+    if (!peer) return json(res, { ok: false, error: 'peer is required' }, 400);
+    try {
+      const response = await fetch(`${peer}/api/journal`, { signal: AbortSignal.timeout(20_000) });
+      if (!response.ok) throw new Error(`peer journal HTTP ${response.status}`);
+      const envelope = await response.json();
+      const check = verifyJournal(envelope);
+      if (!check.ok) return json(res, { ok: false, error: check.reason }, 400);
+      if (envelope.seed !== world.seed) return json(res, { ok: false, error: 'seed mismatch' }, 400);
+      const remoteTerm = resolveTerm(envelope.events, { nodes: NODES, termEvents: TERM_EVENTS }).term;
+      if (remoteTerm < currentTerm()) {
+        return json(res, { ok: false, error: `peer term ${remoteTerm} is behind local term ${currentTerm()}` }, 409);
+      }
+      let rebuilt;
+      try {
+        rebuilt = rebuildFromJournal(envelope);
+      } catch (err) {
+        return json(res, { ok: false, error: String(err?.message || err) }, 400);
+      }
+      if (stateHash(rebuilt) !== envelope.stateHash) {
+        return json(res, { ok: false, error: 'rebuilt state does not match peer hash' }, 409);
+      }
+      world = rebuilt;
+      syncFault = '';
+      handoffReady = false;
+      handoffStart = 0;
+      lastSyncError = '';
+      lastSyncAt = Date.now();
+      lastSyncedTick = world.tick;
+      return json(res, {
+        ok: true,
+        tick: world.tick,
+        events: world.nextSeq - 1,
+        stateHash: stateHash(world),
+        term: currentTerm(),
+      });
+    } catch (err) {
+      return json(res, { ok: false, error: String(err?.message || err) }, 502);
+    }
   }
 
   if (url.pathname === '/api/chronicle') {
@@ -461,6 +584,41 @@ async function syncPeer() {
   }
 }
 
+// 对端任期更高、但本地尾巴和它对不上时，以更高任期为准：
+// 用对方的完整日志重建本地世界。日志只追加，但“未同步的旧任期尾巴”
+// 没有被任何人接受，丢弃它是 B 阶段 v1 的确定规则（更高 term 优先）。
+// 同任期内出现分叉仍然只报 syncFault，不在这里合并。
+async function adoptPeerJournal(peer) {
+  const localTerm = termState().term;
+  const response = await fetch(`${peer}/api/journal`, { signal: AbortSignal.timeout(20_000) });
+  if (!response.ok) throw new Error(`peer full journal HTTP ${response.status}`);
+  const envelope = await response.json();
+  const check = verifyJournal(envelope);
+  if (!check.ok) throw new Error(`conflict: peer journal ${check.reason}`);
+  if (envelope.seed !== world.seed) throw new Error('conflict: peer seed mismatch');
+
+  const peerTerm = resolveTerm(envelope.events, { nodes: NODES, termEvents: TERM_EVENTS }).term;
+  if (peerTerm <= localTerm) throw new Error('conflict: peer journal has no higher term');
+
+  const dropped = Math.max(0, world.nextSeq - 1 - envelope.toSeq);
+  let rebuilt;
+  try {
+    rebuilt = rebuildFromJournal(envelope);
+  } catch (err) {
+    throw new Error(`conflict: ${String(err?.message || err)}`);
+  }
+  if (stateHash(rebuilt) !== envelope.stateHash) {
+    throw new Error('conflict: adopted state hash mismatch');
+  }
+
+  world = rebuilt;
+  syncFault = '';
+  lastSyncAt = Date.now();
+  lastSyncedTick = world.tick;
+  console.log(`  以第 ${peerTerm} 任的日志为准重建，丢弃本地 ${dropped} 条未同步事件`);
+  return { adopted: true, dropped };
+}
+
 // peer 模式：每个节点都从对端拉缺失日志。谁拉谁都不改变“日志是权威”这条。
 async function pullFromPeer(peer) {
   const identityResponse = await fetch(`${peer}/api/identity`, {
@@ -468,12 +626,30 @@ async function pullFromPeer(peer) {
   });
   if (!identityResponse.ok) throw new Error(`peer identity HTTP ${identityResponse.status}`);
   const identity = await identityResponse.json();
+  // 拿到身份就算一次真实接触：租约只看这个，不看谁先发起。
+  const seenAt = Date.now();
+  noteNodeSeen(identity.nodeId, seenAt);
+  peerHealth.set(peer, {
+    nodeId: identity.nodeId,
+    lastSeenAt: seenAt,
+    term: identity.term,
+    events: identity.events,
+    error: '',
+  });
   if (identity.seed !== world.seed) throw new Error('conflict: peer seed mismatch');
 
+  const localTerm = termState().term;
+  const peerTerm = Number.isInteger(identity.term) ? identity.term : localTerm;
+
   const localHead = world.nextSeq - 1;
-  if (identity.events < localHead) return { behind: true };
+  if (identity.events < localHead) {
+    // 对端更短、任期却更高：本地尾巴是一段没人接受的旧任期事件。
+    if (peerTerm > localTerm) return adoptPeerJournal(peer);
+    return { behind: true };
+  }
 
   if (identity.events === localHead) {
+    if (peerTerm > localTerm) return adoptPeerJournal(peer);
     // 头部相同却没有同一个状态，说明已经分叉，必须停下来。
     if (identity.tick === world.tick && identity.stateHash !== stateHash(world)) {
       throw new Error('conflict: same head but state hash differs');
@@ -492,9 +668,14 @@ async function pullFromPeer(peer) {
   const result = applyChunk(world, chunk);
   if (!result.ok) {
     if (result.reason === 'stale chunk') return { stale: true };
+    // 前缀对不上但对方任期更高：以更高任期为准确认并重建。
+    if (peerTerm > localTerm) return adoptPeerJournal(peer);
     throw new Error(`conflict: ${result.reason}`);
   }
-  if (!result.matched) throw new Error('conflict: state hash mismatch');
+  if (!result.matched) {
+    if (peerTerm > localTerm) return adoptPeerJournal(peer);
+    throw new Error('conflict: state hash mismatch');
+  }
 
   world = result.world;
   lastSyncAt = Date.now();
@@ -503,20 +684,58 @@ async function pullFromPeer(peer) {
   return { applied: true, tick: world.tick };
 }
 
+// 租约到期后的接管：不是抢写，而是把“第几任、谁是权威”记进日志。
+// 只有当前权威按轮值顺序数过来的下一个节点先接手；再下一个多等一个 TAKEOVER_MS，
+// 给更近的节点留出窗口。旧权威回来时会读到更高任期的记录，自动变成跟随者。
+function attemptTakeover(now = Date.now()) {
+  if (!PEER || syncFault) return false;
+  const state = termState();
+  if (state.authorityId === NODE_ID) return false;
+
+  const seenAt = nodeLastSeen.get(state.authorityId) || startupAt;
+  const silentFor = now - seenAt;
+  const offset = takeoverOffset(state.authorityId);
+  if (silentFor < TAKEOVER_MS * offset) return false;
+
+  // 本周期刚拉过日志：只要有一个“还活着”的对端已经在更高任期，就让它先来。
+  // 很久没联系上的旧 term 不算数，否则一次见过的高任期会把接管永久卡住。
+  for (const health of peerHealth.values()) {
+    if (now - health.lastSeenAt > LEASE_MS) continue;
+    if (Number.isInteger(health.term) && health.term > state.term) return false;
+  }
+
+  const nextTerm = Math.max(state.term, state.baseTerm) + 1;
+  logTermEvent(world, { term: nextTerm, authorityId: NODE_ID, reason: 'lease-expired' });
+  saveWorld();
+  lastTakeoverAt = now;
+  lastSyncError = '';
+  handoffReady = false;
+  handoffStart = 0;
+  console.log(
+    `  租约到期：${state.authorityId} 已失联 ${Math.round(silentFor / 1000)}s，` +
+      `${NODE_ID} 接任第 ${nextTerm} 任`
+  );
+  return true;
+}
+
 async function syncPeers() {
   if (!PEER || syncing || world.inflight > 0) return;
   syncing = true;
 
-  let allOk = true;
+  let conflictThisCycle = false;
   let firstError = '';
   for (const peer of PEERS) {
     try {
       await pullFromPeer(peer);
     } catch (err) {
-      allOk = false;
       const message = String(err?.message || err);
       if (!firstError) firstError = message;
-      if (message.startsWith('conflict:')) syncFault = message;
+      if (message.startsWith('conflict:')) {
+        conflictThisCycle = true;
+        if (!syncFault) syncFault = message;
+      }
+      const health = peerHealth.get(peer);
+      if (health) health.error = message;
     }
   }
 
@@ -527,14 +746,27 @@ async function syncPeers() {
     return;
   }
 
+  const now = Date.now();
+  attemptTakeover(now);
+
+  const authorityId = authorityFor();
+  if (isAuthority()) sawSelfAuthority = true;
+  if (authorityId !== lastAuthorityId) {
+    // 换任（正常轮换或接管）时必须重新交接：先追平，再等一个安静周期。
+    lastAuthorityId = authorityId;
+    handoffReady = false;
+    handoffStart = 0;
+  }
+
   if (!isAuthority()) {
     handoffReady = false;
     handoffStart = 0;
   } else if (syncFault) {
     handoffReady = false;
   } else {
-    if (!handoffStart) handoffStart = Date.now();
-    if (allOk && Date.now() - handoffStart >= HANDOFF_SETTLE_MS) handoffReady = true;
+    if (!handoffStart) handoffStart = now;
+    // 对端失联不阻塞交接；只有真正的分叉冲突才要求停下。
+    if (!conflictThisCycle && now - handoffStart >= HANDOFF_SETTLE_MS) handoffReady = true;
   }
 
   syncing = false;

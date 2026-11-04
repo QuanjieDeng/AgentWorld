@@ -10,6 +10,7 @@ import {
   loadWorld,
   TURNING_TRIGGERS,
   logDecision,
+  logTermEvent,
   applyTurning,
 } from './engine.js';
 import { processBrains } from './brain.js';
@@ -25,6 +26,7 @@ import {
   stateHash,
   eventsHash,
   compareJournals,
+  resolveTerm,
 } from './sync.js';
 
 function runWorld(seed, ticks) {
@@ -284,6 +286,71 @@ test('导出日志里不包含 API Key 或模型配置', () => {
   assert.ok(!text.includes('http://example.invalid'));
   assert.ok(!text.includes('test-model'));
   assert.ok(!text.includes('"llmAgents"'));
+});
+
+test('没有交接记录时，任期与权威由事件数轮换决定', () => {
+  const events = Array.from({ length: 25 }, (_, i) => ({ seq: i + 1, t: 0, type: 'x' }));
+  const state = resolveTerm(events, { nodes: ['a', 'b', 'c'], termEvents: 10 });
+
+  assert.equal(state.baseTerm, 2);
+  assert.equal(state.term, 2);
+  assert.equal(state.authorityId, 'c');
+  assert.equal(state.source, 'rotation');
+});
+
+test('交接记录优先于事件数轮换，直到日志自己追上越过它', () => {
+  const build = (count) => {
+    const events = Array.from({ length: count }, (_, i) => ({ seq: i + 1, t: 0, type: 'x' }));
+    events[15] = {
+      seq: 16,
+      t: 0,
+      type: 'term',
+      payload: { term: 4, authorityId: 'b', reason: 'lease-expired' },
+    };
+    return events;
+  };
+
+  const before = resolveTerm(build(45), { nodes: ['a', 'b', 'c'], termEvents: 10 });
+  assert.equal(before.term, 4);
+  assert.equal(before.authorityId, 'b');
+  assert.equal(before.source, 'terms');
+
+  // 事件数轮换到第 6 任后，交接记录不再压过轮换。
+  const after = resolveTerm(build(60), { nodes: ['a', 'b', 'c'], termEvents: 10 });
+  assert.equal(after.term, 6);
+  assert.equal(after.authorityId, 'a');
+  assert.equal(after.source, 'rotation');
+});
+
+test('交接记录写进日志后能逐字节重放，也能同步给落后的节点', () => {
+  const early = runWorld(7, 200);
+  const primary = loadWorld(serializeWorld(early));
+  logTermEvent(primary, { term: 4, authorityId: 'peer-b', reason: 'lease-expired' });
+  for (let i = 0; i < 120; i++) {
+    tick(primary);
+    processBrains(primary);
+  }
+
+  const journal = exportJournal(primary);
+  const termEvent = journal.events.find((e) => e.type === 'term');
+  assert.ok(termEvent, '导出的日志里应当有交接记录');
+  assert.equal(termEvent.payload.authorityId, 'peer-b');
+
+  const rebuilt = rebuildFromJournal(journal);
+  assert.equal(stateHash(rebuilt), stateHash(primary));
+  assert.deepEqual(serializeWorld(rebuilt), serializeWorld(primary));
+  assert.equal(
+    rebuilt.eventLog.find((e) => e.type === 'term')?.seq,
+    termEvent.seq,
+    '重放必须把交接记录放回原来的序号'
+  );
+
+  const chunk = exportJournal(primary, { fromSeq: early.nextSeq });
+  const result = applyChunk(loadWorld(serializeWorld(early)), chunk);
+  assert.equal(result.ok, true);
+  assert.equal(result.matched, true);
+  assert.equal(stateHash(result.world), stateHash(primary));
+  assert.ok(result.world.eventLog.some((e) => e.type === 'term'));
 });
 
 test('日志比较给出确定的先后顺序，为轮值排序预留', () => {

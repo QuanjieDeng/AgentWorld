@@ -373,7 +373,40 @@ function appendEvent(world, entry, { ui = true } = {}) {
   return entry;
 }
 
+// 轮值交接写在日志里的 term 事件。它是惰性的：不改变模拟状态，
+// 但会被事件哈希覆盖，所以重放时必须回到原来的序号位置。
+// 违反这一点的后果是两台机器的 eventsHash 分叉——这正是我们要的报警方式。
+function flushReplayTerms(world) {
+  const queue = world.replay?.terms;
+  if (!queue || !queue.length) return;
+  while (queue.length && queue[0].seq === world.nextSeq) {
+    const entry = queue.shift();
+    world.eventLog.push(entry);
+    // 和线上 appendEvent 一样进界面日志，保证存档逐字节一致。
+    world.log.push(entry);
+    if (world.log.length > 400) world.log.shift();
+    world.nextSeq++;
+  }
+}
+
+export function termEventText(term, authorityId, reason) {
+  const why = reason === 'lease-expired' ? '租约到期' : String(reason || '轮换');
+  return `第 ${term} 任日志权威：${authorityId}（${why}）`;
+}
+
+// 只有当前权威可以调用。调用方负责确认自己确实持有写入权。
+export function logTermEvent(world, { term, authorityId, reason }) {
+  return logEvent(world, 'term', termEventText(term, authorityId, reason), null, {
+    term,
+    authorityId,
+    reason,
+  });
+}
+
+export { flushReplayTerms };
+
 export function logEvent(world, type, text, agentId = null, payload = null) {
+  flushReplayTerms(world);
   return appendEvent(world, {
     seq: world.nextSeq++,
     t: world.tick,
@@ -387,6 +420,7 @@ export function logEvent(world, type, text, agentId = null, payload = null) {
 }
 
 export function logDecision(world, { agentId, source, action, rngAfter }) {
+  flushReplayTerms(world);
   const event = appendEvent(
     world,
     {
@@ -2309,11 +2343,15 @@ export function loadWorld(data) {
   };
 }
 
-export function replayDecisions(world, decisions, turnings = []) {
+export function replayDecisions(world, decisions, turnings = [], terms = []) {
   world.replay = {
     queue: decisions.map((d) => ({ ...d, action: { ...d.action } })),
     index: 0,
     turnings: turnings.map((t) => ({ ...t })),
+    // term 事件按原始序号插回日志；它不是决策，只是交接记录。
+    terms: terms
+      .map((e) => JSON.parse(JSON.stringify(e)))
+      .sort((a, b) => a.seq - b.seq),
   };
   world.pendingDecisions = [];
   return world;
