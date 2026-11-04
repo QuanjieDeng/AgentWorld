@@ -339,6 +339,8 @@ export function createWorld(seed = 20261102) {
       exiledUntil: 0,
       lastRitualDay: 0,
       presence: 'offline',
+      // 在线租约：world.tick 超过这个值还没续期，就回到规则驾驶。
+      presenceUntil: 0,
       remembrance: DEFAULT_REMEMBRANCE,
       fadeStage: 0,
       faded: false,
@@ -373,17 +375,27 @@ function appendEvent(world, entry, { ui = true } = {}) {
   return entry;
 }
 
-// 轮值交接写在日志里的 term 事件。它是惰性的：不改变模拟状态，
-// 但会被事件哈希覆盖，所以重放时必须回到原来的序号位置。
-// 违反这一点的后果是两台机器的 eventsHash 分叉——这正是我们要的报警方式。
-function flushReplayTerms(world) {
-  const queue = world.replay?.terms;
+// 重放队列里有两类“不是决策”的记录：
+//   - term：轮值交接，惰性，只占序号；
+//   - presence：在线租约，除了占序号还要改状态。
+// 它们必须回到原来的序号位置，否则 eventsHash 或状态哈希会分叉。
+function flushReplayRecords(world) {
+  const queue = world.replay?.records;
   if (!queue || !queue.length) return;
-  while (queue.length && queue[0].seq === world.nextSeq) {
-    const entry = queue.shift();
-    world.eventLog.push(entry);
+  while (queue.length && queue[0].event.seq === world.nextSeq) {
+    const { kind, event } = queue.shift();
+    if (kind === 'presence') {
+      const agent = world.agents.find((a) => a.id === event.payload?.agentId);
+      if (agent) {
+        const online = !!event.payload.online;
+        agent.presence = online ? 'online' : 'offline';
+        agent.presenceUntil = online ? Math.max(0, Number(event.payload.untilTick) || 0) : 0;
+        if (online) agent.fadeStage = 0;
+      }
+    }
+    world.eventLog.push(event);
     // 和线上 appendEvent 一样进界面日志，保证存档逐字节一致。
-    world.log.push(entry);
+    world.log.push(event);
     if (world.log.length > 400) world.log.shift();
     world.nextSeq++;
   }
@@ -403,10 +415,10 @@ export function logTermEvent(world, { term, authorityId, reason }) {
   });
 }
 
-export { flushReplayTerms };
+export { flushReplayRecords };
 
 export function logEvent(world, type, text, agentId = null, payload = null) {
-  flushReplayTerms(world);
+  flushReplayRecords(world);
   return appendEvent(world, {
     seq: world.nextSeq++,
     t: world.tick,
@@ -420,7 +432,7 @@ export function logEvent(world, type, text, agentId = null, payload = null) {
 }
 
 export function logDecision(world, { agentId, source, action, rngAfter }) {
-  flushReplayTerms(world);
+  flushReplayRecords(world);
   const event = appendEvent(
     world,
     {
@@ -1385,6 +1397,64 @@ function fadeAgent(world, agent) {
   updateFactionLeadership(world, agent);
 }
 
+// ---------- 在线（清醒 / 睡着） ----------
+//
+// 在线不是 UI 状态，而是写进事件日志的一段租约：untilTick 之前，这个人醒着，
+// 不参与每日遗忘；租约到期没有续期，就在同一个 tick 回到规则驾驶。
+// 这样所有节点从同一条日志得到同一个“谁醒着”，stateHash 不会分叉。
+
+const PRESENCE_ONLINE_TEXT = (name) => `有人还记着${name}，${name}醒着。`;
+const PRESENCE_OFFLINE_TEXT = (name) => `${name}又睡了过去，身体交回本能。`;
+
+export function setPresence(
+  world,
+  agent,
+  { online = false, untilTick = 0, by = null, reason = 'tend' } = {}
+) {
+  if (!agent || !agent.alive) return null;
+  const nextOnline = !!online;
+  const nextUntil = nextOnline ? Math.max(0, Math.floor(Number(untilTick) || 0)) : 0;
+
+  // 续期不改变状态时也要写一条事件：其他节点就是靠这条事件延长租约的。
+  if (nextOnline && agent.presence === 'online' && nextUntil <= (agent.presenceUntil || 0)) {
+    return null;
+  }
+  if (!nextOnline && agent.presence === 'offline') return null;
+
+  agent.presence = nextOnline ? 'online' : 'offline';
+  agent.presenceUntil = nextUntil;
+  if (nextOnline) agent.fadeStage = 0;
+
+  return logEvent(
+    world,
+    'presence',
+    nextOnline ? PRESENCE_ONLINE_TEXT(agent.name) : PRESENCE_OFFLINE_TEXT(agent.name),
+    agent.id,
+    { agentId: agent.id, online: nextOnline, untilTick: nextUntil, by: by || null, reason }
+  );
+}
+
+// 租约到期：确定性状态变化，所有节点在同一个 tick 做同样的事。
+// 重放时不要把事件再写一遍——那条事件已经在日志/重放队列里了。
+function expirePresence(world) {
+  const replaying = !!world.replay;
+  for (const agent of world.agents) {
+    if (!agent.alive || agent.presence !== 'online') continue;
+    if (world.tick <= (agent.presenceUntil || 0)) continue;
+    agent.presence = 'offline';
+    agent.presenceUntil = 0;
+    if (!replaying) {
+      logEvent(world, 'presence', PRESENCE_OFFLINE_TEXT(agent.name), agent.id, {
+        agentId: agent.id,
+        online: false,
+        untilTick: 0,
+        by: null,
+        reason: 'lease-expired',
+      });
+    }
+  }
+}
+
 export function decayRemembrance(world) {
   const decay = world.config.remembranceDecay ?? DEFAULT_REMEMBRANCE_DECAY;
   for (const agent of world.agents) {
@@ -2170,6 +2240,7 @@ export function tick(world) {
   world.clock = `${String(Math.floor(minute / 60)).padStart(2, '0')}:${String(minute % 60).padStart(2, '0')}`;
   world.isNight = minute < 360 || minute >= 1080;
 
+  expirePresence(world);
   if (world.tick % TICKS_PER_DAY === 0) decayRemembrance(world);
 
   if (world.isNight && !world.nightActive) {
@@ -2343,15 +2414,19 @@ export function loadWorld(data) {
   };
 }
 
-export function replayDecisions(world, decisions, turnings = [], terms = []) {
+export function replayDecisions(world, decisions, turnings = [], terms = [], presences = []) {
+  // term 与 presence 都不是决策，但都必须按原始序号插回日志。
+  // presence 还要在插回时改状态；term 只占序号。
+  const records = [
+    ...terms.map((e) => ({ kind: 'term', event: JSON.parse(JSON.stringify(e)) })),
+    ...presences.map((e) => ({ kind: 'presence', event: JSON.parse(JSON.stringify(e)) })),
+  ].sort((a, b) => a.event.seq - b.event.seq);
+
   world.replay = {
     queue: decisions.map((d) => ({ ...d, action: { ...d.action } })),
     index: 0,
     turnings: turnings.map((t) => ({ ...t })),
-    // term 事件按原始序号插回日志；它不是决策，只是交接记录。
-    terms: terms
-      .map((e) => JSON.parse(JSON.stringify(e)))
-      .sort((a, b) => a.seq - b.seq),
+    records,
   };
   world.pendingDecisions = [];
   return world;

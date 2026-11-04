@@ -16,6 +16,7 @@ import {
   deliverLetter,
   letterCooldownLeft,
   logTermEvent,
+  setPresence,
   MS_PER_TICK,
 } from './engine.js';
 import { advanceOffline, stepWorld } from './persistence.js';
@@ -93,6 +94,11 @@ const TRUST_FILE = process.env.TRUST_FILE
 const NODE_CLOCK_SKEW_MS = Math.max(5000, Number(process.env.NODE_CLOCK_SKEW_MS) || 60_000);
 const REPLAY_TTL_MS = Math.max(NODE_CLOCK_SKEW_MS, Number(process.env.REPLAY_TTL_MS) || 300_000);
 
+// 在线租约：观看者心跳的有效期（现实时间）与写进日志的清醒租约（世界 tick）。
+// 1 tick = 1 世界分钟；默认租约 300 tick ≈ 现实 12.5 秒。
+const TENDER_TTL_MS = Math.max(1000, Number(process.env.TENDER_TTL_MS) || 15_000);
+const PRESENCE_LEASE_TICKS = Math.max(10, Number(process.env.PRESENCE_LEASE_TICKS) || 300);
+
 // 可选 TLS：同时给出证书和私钥就换成 https，对端 URL 也要写 https://。
 const TLS_KEY_FILE = process.env.TLS_KEY_FILE ? path.resolve(process.env.TLS_KEY_FILE) : '';
 const TLS_CERT_FILE = process.env.TLS_CERT_FILE ? path.resolve(process.env.TLS_CERT_FILE) : '';
@@ -144,12 +150,18 @@ let handoffStart = 0;
 let lastAuthorityId = null;
 let lastTakeoverAt = 0;
 let sawSelfAuthority = false;
+// 上次因更高任期重建世界时丢掉了多少条本地未同步事件。
+// 分区愈合后这里会非零；普通故障恢复（旧权威崩溃）也可能非零。
+let lastAdoption = null;
 
 const startupAt = Date.now();
 // 每个已知节点的最后一次真实接触（拉身份成功，或对方来写日志）。
 // 墙钟只用来判断“失联多久”，不参与排序；排序只看日志里的 term / seq。
 const nodeLastSeen = new Map(NODES.map((id) => [id, startupAt]));
 const peerHealth = new Map(); // url -> { nodeId, lastSeenAt, term, events, error }
+// viewerId -> { agentId, at }。这是本机观看者的守望，不跨节点同步；
+// 只有当前权威会把它翻译成日志里的 presence 事件。
+const tenders = new Map();
 
 // 轮值日志权威：term 优先取日志里最后一次交接记录，其次由事件数轮换。
 // 所有节点从同一条日志算出同一个排序。
@@ -193,6 +205,51 @@ function canAdvance() {
   if (world.config.paused) return false;
   if (!PEER) return true;
   return !syncFault && isAuthority() && handoffReady;
+}
+
+// 观看者的守望心跳：谁被看着，谁就醒着。只有当前权威能把它写进日志。
+// 返回本次实际写了几条 presence 事件（续期也算）。
+function activeTenders(now = Date.now()) {
+  const active = new Map(); // agentId -> viewerId
+  for (const [viewerId, tender] of tenders) {
+    if (now - tender.at > TENDER_TTL_MS) {
+      tenders.delete(viewerId);
+      continue;
+    }
+    const agent = world.agents.find((a) => a.id === tender.agentId && a.alive && !a.faded);
+    if (!agent) {
+      tenders.delete(viewerId);
+      continue;
+    }
+    if (!active.has(agent.id)) active.set(agent.id, viewerId);
+  }
+  return active;
+}
+
+function reconcilePresence(now = Date.now()) {
+  if (!canWriteLocally()) return 0;
+  const active = activeTenders(now);
+  const renewBelow = Math.floor(PRESENCE_LEASE_TICKS / 2);
+  let written = 0;
+  for (const agent of world.agents) {
+    if (!agent.alive || agent.faded) continue;
+    if (active.has(agent.id)) {
+      const remaining = (agent.presenceUntil || 0) - world.tick;
+      if (agent.presence !== 'online' || remaining <= renewBelow) {
+        const event = setPresence(world, agent, {
+          online: true,
+          untilTick: world.tick + PRESENCE_LEASE_TICKS,
+          by: active.get(agent.id),
+          reason: 'tend',
+        });
+        if (event) written++;
+      }
+    } else if (agent.presence === 'online') {
+      const event = setPresence(world, agent, { online: false, reason: 'no-tender' });
+      if (event) written++;
+    }
+  }
+  return written;
 }
 
 function applyApiConfig(source) {
@@ -440,6 +497,47 @@ async function handleApi(req, res, url) {
     return json(res, { ok: true, heard, cooldownLeft: letterCooldownLeft(world, a) });
   }
 
+  // 观看者的守望心跳。agentId 为空表示“我不再看任何人了”。
+  // 这里不写日志；只有当前权威的下一个 reconcilePresence 才把它翻译成 presence 事件。
+  if (url.pathname === '/api/presence') {
+    const viewerId = String(body.viewerId || '').slice(0, 64);
+    if (!viewerId) return json(res, { ok: false, error: 'viewerId is required' }, 400);
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+
+    const agentId = body.agentId ? String(body.agentId).slice(0, 32) : '';
+    let agent = null;
+    if (agentId) {
+      agent = world.agents.find((a) => a.id === agentId && a.alive && !a.faded);
+      if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+      tenders.set(viewerId, { agentId, at: Date.now() });
+    } else {
+      tenders.delete(viewerId);
+    }
+
+    const wrote = reconcilePresence();
+    if (!canWriteLocally()) {
+      return json(
+        res,
+        {
+          ok: false,
+          error: 'this node is not the log authority',
+          authorityId: authorityFor(),
+          presence: agent ? agent.presence : null,
+        },
+        409
+      );
+    }
+    return json(res, {
+      ok: true,
+      agentId: agentId || null,
+      presence: agent ? agent.presence : null,
+      presenceUntil: agent ? agent.presenceUntil || 0 : 0,
+      leaseTicks: PRESENCE_LEASE_TICKS,
+      tenders: tenders.size,
+      wrote,
+    });
+  }
+
   if (url.pathname === '/api/timeline') {
     return json(res, { currentDay: world.day || 1, days: daySummaries(world) });
   }
@@ -492,6 +590,13 @@ async function handleApi(req, res, url) {
       authorityLastSeenAgoMs: PEER && !selfAuthority ? silentFor : 0,
       takeoverEtaMs: PEER && !selfAuthority ? Math.max(0, TAKEOVER_MS * offset - silentFor) : null,
       lastTakeoverAt: PEER && lastTakeoverAt ? lastTakeoverAt : null,
+      lastAdoption: lastAdoption || null,
+      trustedPeers: [...trust.pins.entries()].map(([nodeId, pin]) => ({
+        nodeId,
+        keyId: pin.keyId,
+        firstSeenAt: pin.firstSeenAt,
+        lastSeenAt: pin.lastSeenAt,
+      })),
       syncFault: syncFault || null,
       lastSyncAt: lastSyncAt || null,
       lastSyncedTick,
@@ -618,6 +723,7 @@ async function handleApi(req, res, url) {
       if (stateHash(rebuilt) !== envelope.stateHash) {
         return json(res, { ok: false, error: 'rebuilt state does not match peer hash' }, 409);
       }
+      const dropped = Math.max(0, world.nextSeq - 1 - envelope.toSeq);
       world = rebuilt;
       syncFault = '';
       handoffReady = false;
@@ -625,12 +731,14 @@ async function handleApi(req, res, url) {
       lastSyncError = '';
       lastSyncAt = Date.now();
       lastSyncedTick = world.tick;
+      lastAdoption = { at: Date.now(), from: peer, term: remoteTerm, dropped, via: 'manual' };
       return json(res, {
         ok: true,
         tick: world.tick,
         events: world.nextSeq - 1,
         stateHash: stateHash(world),
         term: currentTerm(),
+        dropped,
       });
     } catch (err) {
       return json(res, { ok: false, error: String(err?.message || err) }, 502);
@@ -825,6 +933,7 @@ async function adoptPeerJournal(peer) {
   syncFault = '';
   lastSyncAt = Date.now();
   lastSyncedTick = world.tick;
+  lastAdoption = { at: Date.now(), from: peer, term: peerTerm, dropped, via: 'auto' };
   console.log(`  以第 ${peerTerm} 任的日志为准重建，丢弃本地 ${dropped} 条未同步事件`);
   return { adopted: true, dropped };
 }
@@ -1018,6 +1127,8 @@ function saveWorld() {
 }
 
 setInterval(saveWorld, SAVE_INTERVAL_MS).unref();
+// 守望心跳可能在两次点击之间过期；每秒核对一次，权威才会续租或让人睡着。
+setInterval(() => reconcilePresence(), 1000).unref();
 if (PEER) setInterval(syncPeers, SYNC_INTERVAL_MS).unref();
 else if (PEER_URL && !MIRROR) setInterval(syncPeer, SYNC_INTERVAL_MS).unref();
 

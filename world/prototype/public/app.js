@@ -99,6 +99,58 @@ const VIEWER_ID = (() => {
   return id;
 })();
 
+// ---------- 守望（在线轴） ----------
+// 你跟随时，本机节点会把这个人的“清醒租约”写进日志；切走或关页面就放开。
+// 只有当前日志权威能让它生效，跟随节点会返回 409，但心跳本身无害。
+let lastPresenceTarget = undefined;
+
+function currentTendTarget() {
+  return mode === 'follow' && selectedId ? selectedId : null;
+}
+
+async function sendPresence(agentId, { beacon = false } = {}) {
+  const payload = { viewerId: VIEWER_ID, agentId: agentId || null };
+  try {
+    if (beacon && navigator.sendBeacon) {
+      navigator.sendBeacon(
+        '/api/presence',
+        new Blob([JSON.stringify(payload)], { type: 'application/json' })
+      );
+      return;
+    }
+    await fetch('/api/presence', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+  } catch {
+    // 节点短暂离线时不打扰观看。
+  }
+}
+
+function syncPresence(force = false) {
+  const target = currentTendTarget();
+  if (!force && target === lastPresenceTarget) return;
+  lastPresenceTarget = target;
+  sendPresence(target);
+}
+
+setInterval(() => {
+  const target = currentTendTarget();
+  if (document.visibilityState === 'visible' && target) sendPresence(target);
+}, 5000);
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') {
+    lastPresenceTarget = null;
+    sendPresence(null, { beacon: true });
+  } else {
+    syncPresence(true);
+  }
+});
+
+window.addEventListener('pagehide', () => sendPresence(null, { beacon: true }));
+
 function escapeHtml(s) {
   return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }
@@ -416,6 +468,13 @@ function renderAgentPanel() {
       <span class="dot" style="background:${a.color}"></span>
       <b>${escapeHtml(a.name)}</b>
       ${a.useLLM ? '<span class="badge">LLM</span>' : ''}
+      ${
+        a.alive
+          ? a.presence === 'online'
+            ? '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">醒着 · 有人守着</span>'
+            : '<span class="badge" style="color:#b9b2a0;border-color:#4a4a44">睡着 · 本能</span>'
+          : ''
+      }
       ${!a.alive ? '<span class="badge" style="color:#d98b82;border-color:#5a3a36">已死</span>' : ''}
       ${a.identity ? `<span class="badge">${escapeHtml(a.identity)}</span>` : ''}
     </div>
@@ -438,6 +497,10 @@ function renderAgentPanel() {
         ? '<span class="gone">已经被世界抹去。</span>'
         : `被记住 <b>${a.remembrance}</b> / 100${
             a.fadeStage ? ` <span class="low">· 正在淡出（${a.fadeStage}/3）</span>` : ''
+          }${
+            a.presence === 'online'
+              ? ' · 有人守着，不会淡出'
+              : ' · 没人看着，按本能活着'
           }`
     }</div>
     ${a.turningPoints.length
@@ -783,6 +846,9 @@ function updateUI() {
     lastChronicleDay = state.day;
     loadChronicle(currentDay(), currentDay());
   }
+
+  // 选择变了就告诉节点；同一个目标不重复发，心跳由上面的定时器负责。
+  syncPresence();
 }
 
 // ---------- 交互 ----------

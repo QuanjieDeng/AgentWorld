@@ -18,7 +18,7 @@ import {
   serializeWorld,
   loadWorld,
   applyTurning,
-  flushReplayTerms,
+  flushReplayRecords,
 } from './engine.js';
 import { processBrains } from './brain.js';
 
@@ -90,6 +90,19 @@ export function turningsFromEvents(events) {
 export function termRecordsFromEvents(events) {
   return events
     .filter((e) => e.type === TERM_EVENT && Number.isInteger(e.payload?.term) && e.payload?.authorityId)
+    .map((e) => canonicalEvent(e));
+}
+
+// 在线租约也是日志的一部分：重放时必须在原序号位置改 presence / presenceUntil，
+// 否则同一份日志会重放出“谁醒着”不一致的世界。
+export function presenceRecordsFromEvents(events) {
+  return events
+    .filter(
+      (e) =>
+        e.type === 'presence' &&
+        e.payload?.agentId &&
+        typeof e.payload?.online === 'boolean'
+    )
     .map((e) => canonicalEvent(e));
 }
 
@@ -285,7 +298,7 @@ function applyRecordedTurnings(world, turnings) {
 function clearReplay(world) {
   // 重放模式结束后必须关掉，否则这个世界的居民再也不会做新决定。
   // 日志末尾可能还剩没有后续事件触发的交接记录，收尾时补进日志。
-  flushReplayTerms(world);
+  flushReplayRecords(world);
   world.replay = null;
   world.pendingDecisions = [];
   return world;
@@ -306,8 +319,9 @@ export function rebuildFromJournal(envelope, { until = envelope.toTick } = {}) {
   const decisions = envelope.decisions.filter((d) => d.tick <= target);
   const turnings = turningsFromEvents(envelope.events).filter((t) => t.t <= target);
   const terms = termRecordsFromEvents(envelope.events).filter((e) => e.t <= target);
+  const presences = presenceRecordsFromEvents(envelope.events).filter((e) => e.t <= target);
   const world = createWorld(envelope.seed);
-  replayDecisions(world, decisions, turnings, terms);
+  replayDecisions(world, decisions, turnings, terms, presences);
   while (world.tick < target) {
     tick(world);
     processBrains(world);
@@ -360,7 +374,10 @@ export function applyChunk(localWorld, chunk) {
   const decisions = chunk.decisions.filter((d) => d.seq >= nextSeq && d.tick <= chunk.toTick);
   const turnings = turningsFromEvents(chunk.events).filter((t) => t.t <= chunk.toTick);
   const terms = termRecordsFromEvents(chunk.events).filter((e) => e.t <= chunk.toTick);
-  replayDecisions(world, decisions, turnings, terms);
+  const presences = presenceRecordsFromEvents(chunk.events).filter(
+    (e) => e.seq >= nextSeq && e.t <= chunk.toTick
+  );
+  replayDecisions(world, decisions, turnings, terms, presences);
   if (decisions.some((d) => d.tick <= localWorld.tick)) processBrains(world);
   while (world.tick < chunk.toTick) {
     tick(world);
