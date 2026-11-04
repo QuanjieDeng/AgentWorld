@@ -1,3 +1,5 @@
 world-save*.json
 world-save*.json.tmp
+node-key*.json
+trusted-peers*.json
 node_modules/

@@ -26,7 +26,7 @@ async function freePort() {
   return port;
 }
 
-function launch({ port, saveFile, nodeId, peering }) {
+function launch({ port, saveFile, nodeId, peering, keyFile, trustFile }) {
   const child = spawn(process.execPath, [SERVER], {
     cwd: path.dirname(SERVER),
     env: {
@@ -35,6 +35,8 @@ function launch({ port, saveFile, nodeId, peering }) {
       SEED,
       NODE_ID: nodeId,
       SAVE_FILE: saveFile,
+      NODE_KEY_FILE: keyFile,
+      TRUST_FILE: trustFile,
       SYNC_MODE: 'peer',
       NODES: 'peer-a,peer-b',
       PEERS: peering,
@@ -106,12 +108,16 @@ test('两个全节点轮流写入，并在每个任期后收敛', async (t) => {
     saveFile: path.join(dir, 'peer-a.json'),
     nodeId: 'peer-a',
     peering: urlB,
+    keyFile: path.join(dir, 'key-peer-a.json'),
+    trustFile: path.join(dir, 'trust-peer-a.json'),
   });
   const b = launch({
     port: portB,
     saveFile: path.join(dir, 'peer-b.json'),
     nodeId: 'peer-b',
     peering: urlA,
+    keyFile: path.join(dir, 'key-peer-b.json'),
+    trustFile: path.join(dir, 'trust-peer-b.json'),
   });
   t.after(async () => {
     await stop(a);

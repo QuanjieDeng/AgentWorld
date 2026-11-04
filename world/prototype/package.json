@@ -4,7 +4,7 @@
   "type": "module",
   "scripts": {
     "start": "node server.js",
-    "test": "node --test test-foundation.js test-knowledge.js test-distortion.js test-inheritance.js test-turning.js test-language.js test-institutions.js test-fade.js test-chronicle.js test-sync.js test-network-sync.js test-peer-rotation.js test-peer-failover.js",
+    "test": "node --test test-foundation.js test-knowledge.js test-distortion.js test-inheritance.js test-turning.js test-language.js test-institutions.js test-fade.js test-chronicle.js test-sync.js test-identity.js test-network-sync.js test-peer-rotation.js test-peer-failover.js",
     "test:sim": "node test-sim.js",
     "test:cycles": "node test-cycles.js"
   }

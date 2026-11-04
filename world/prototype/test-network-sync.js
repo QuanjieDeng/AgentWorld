@@ -23,7 +23,7 @@ async function freePort() {
   return port;
 }
 
-function launch({ port, saveFile, nodeId, mirror = false, peerUrl = '' }) {
+function launch({ port, saveFile, nodeId, mirror = false, peerUrl = '', keyFile, trustFile }) {
   const child = spawn(process.execPath, [SERVER], {
     cwd: path.dirname(SERVER),
     env: {
@@ -32,6 +32,8 @@ function launch({ port, saveFile, nodeId, mirror = false, peerUrl = '' }) {
       SEED: '97123',
       NODE_ID: nodeId,
       SAVE_FILE: saveFile,
+      NODE_KEY_FILE: keyFile,
+      TRUST_FILE: trustFile,
       MIRROR: mirror ? '1' : '0',
       PEER_URL: peerUrl,
       SYNC_TOKEN: TOKEN,
@@ -94,12 +96,16 @@ test('两节点通过 HTTP 轮询追平，镜像重启后自动恢复同步', as
     saveFile: primarySave,
     nodeId: 'primary-test',
     peerUrl,
+    keyFile: path.join(dir, 'key-primary.json'),
+    trustFile: path.join(dir, 'trust-primary.json'),
   });
   let mirror = launch({
     port: mirrorPort,
     saveFile: mirrorSave,
     nodeId: 'mirror-test',
     mirror: true,
+    keyFile: path.join(dir, 'key-mirror.json'),
+    trustFile: path.join(dir, 'trust-mirror.json'),
   });
   t.after(async () => {
     await stop(primary);
@@ -152,6 +158,8 @@ test('两节点通过 HTTP 轮询追平，镜像重启后自动恢复同步', as
       saveFile: mirrorSave,
       nodeId: 'mirror-test',
       mirror: true,
+      keyFile: path.join(dir, 'key-mirror.json'),
+      trustFile: path.join(dir, 'trust-mirror.json'),
     });
 
     const caughtUp = await waitFor(async () => {

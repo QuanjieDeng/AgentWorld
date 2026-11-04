@@ -41,13 +41,13 @@ node server.js
 - 编年史叙事：引擎只挑关键事件（死亡、脱变、立法、结社、冲突、迁移、收养/继承、淡出）；每个观看者用自己的模型写自己的版本，叙事按「观看者 + 事件段」缓存，不进存档，所以没有官方历史。不配置模型时用本地叙事器，事件照样读得通。
 - 观看界面 v1：重新打开先看到「你不在的时候」；跟随一个人时能看他的师承与继承人、事实 / 他自己的看法 / 个人史三栏，以及「被记住」和淡出进度；全岛模式看人口、语言、制度与最近编年史；底部时间轴可以回到任意一个世界日，点开就是那天的编年史。写信后有冷却。
 - `node test-sim.js`：不启动网页，直接让引擎跑 2.5 个世界日，检查死亡、建造、冲突的分布。
-- `npm test`：地基、知识分层、记忆失真、继承、脱变、语言墙、制度、淡出、编年史与同步日志测试，覆盖确定性、事件日志、存档/加载、决策重放、离线推进、事实/信念、密钥不入档、出身映射、知识门槛、教与学、禀赋成长、转述漂移、收养/收徒、遗产与搬入、脱变触发与上限、语言理解与学习、制度填槽与执行、解释权、被惦记与淡出、叙事缓存与观看者隔离、日志导出与校验、快照追平、两节点轮值收敛、租约接任与旧权威回归。
+- `npm test`：地基、知识分层、记忆失真、继承、脱变、语言墙、制度、淡出、编年史、同步日志与节点身份测试，覆盖确定性、事件日志、存档/加载、决策重放、离线推进、事实/信念、密钥不入档、出身映射、知识门槛、教与学、禀赋成长、转述漂移、收养/收徒、遗产与搬入、脱变触发与上限、语言理解与学习、制度填槽与执行、解释权、被惦记与淡出、叙事缓存与观看者隔离、日志导出与校验、快照追平、两节点轮值收敛、租约接任与旧权威回归、Ed25519 信封签名、身份自证、TOFU 信任表、请求防重放。
 
 ## 它还没有什么
 
-- 节点身份签名与自动分区合并（B 阶段后续）：当前只做诚实节点的宕机/恢复与确定性收敛。
+- 自动分区合并与拜占庭容错（B 阶段后续）：当前只做诚实节点的宕机/恢复、签名校验与确定性收敛。
 - 睡眠：真实的在线/离线同步与浅睡（留给 B 阶段）。
-- 跨不可信网络的安全传输：当前 bearer token 经普通 HTTP 传输，只能在可信 LAN/VPN 演示；公网前必须上 TLS。
+- 传输层 TLS 已可配置（`TLS_KEY_FILE` / `TLS_CERT_FILE`），但没有自动化测试；首次信任仍是 TOFU，不防首次 MITM，公网部署还需要证书校验与人工导入节点公钥。
 - 时间轴只回放「那一天的关键事件与叙事」，不能把整张地图倒回去重跑。
 - 叙事缓存只活在当前进程里，重启后重新生成。
 
@@ -67,7 +67,8 @@ node server.js
 - **旧尾巴**：如果回归的旧权威存档比幸存者更新（它失联前最后几条事件没被任何人拉到），以更高任期为准：用幸存者的完整日志重建，丢弃这段旧任期尾巴。只有“同一任期内”的分叉才记 `syncFault` 并停写。
 - **人工出口**：`POST /api/sync/adopt`（带 `SYNC_TOKEN`，body `{"peer":"http://..."}`）用指定对端的完整日志重建本地世界，用于处理无法自动收敛的分叉。
 - **分叉处理**：同一头部却 `stateHash` 不同、或重叠事件不一致时，节点记录 `syncFault` 并停止写入，不静默采用对方状态。
-- **鉴权**：`/api/journal/apply` 只接受 `SYNC_TOKEN` bearer token；peer 模式默认用拉取，不需要对端开放写入。状态页显示节点角色、任期、交接状态和同步错误。
+- **身份与签名**：每个节点首次启动生成 Ed25519 密钥对，写在 `NODE_KEY_FILE`（默认 `node-key-<节点名>.json`），私钥不进存档、不进日志。`/api/journal` 的每个信封都带签名；`/api/identity` 的身份声明由本节点自证。对端第一次接触时把公钥固定进 `TRUST_FILE`（默认 `trusted-peers-<节点名>.json`），之后换钥匙一律拒绝。一个地址换了 `nodeId` 也会被拒绝。
+- **鉴权**：`/api/journal/apply` 与 `/api/sync/adopt` 接受 `SYNC_TOKEN` bearer token **或**节点签名。签名请求带 `x-node-timestamp` / `x-node-nonce` / `x-node-signature`，服务端先验签、再用 nonce 防重放（默认 60 秒时钟窗口、5 分钟 nonce 生命周期）。日志信封的签名者必须与请求签名者是同一个节点。peer 模式默认用拉取，不需要对端开放写入。状态页显示节点角色、任期、交接状态和同步错误。
 
 ### 全节点轮值（主路径）
 
@@ -87,7 +88,17 @@ SYNC_TOKEN='替换成随机长 token' TERM_EVENTS=200 \
 node server.js
 ```
 
-`TERM_EVENTS` 越小，轮换越频繁；默认 200。`LEASE_MS`（默认 6000）是“多久没听到对方”的判定尺度；`TAKEOVER_MS`（默认 `2×LEASE_MS`）是接任前的等待。查看 `/api/identity` 能看到 `role`、`term`、`termSource`、`authorityId`、`successorId`、`handoffReady`、`takeoverEtaMs`、`lastTakeoverAt`、`syncFault` 和每个对端的 `peerHealth`。
+`TERM_EVENTS` 越小，轮换越频繁；默认 200。`LEASE_MS`（默认 6000）是“多久没听到对方”的判定尺度；`TAKEOVER_MS`（默认 `2×LEASE_MS`）是接任前的等待。查看 `/api/identity` 能看到 `role`、`term`、`termSource`、`authorityId`、`successorId`、`handoffReady`、`takeoverEtaMs`、`lastTakeoverAt`、`syncFault`、`keyId`、`publicKey` 和每个对端的 `peerHealth`。
+
+身份相关的可调项：
+
+- `NODE_KEY_FILE`：节点私钥文件，默认 `node-key-<NODE_ID>.json`。**不要提交、不要复制到别的机器**；重启必须复用同一文件，否则对端会拒绝新钥匙。换 `NODE_ID` 前先处理旧文件。
+- `TRUST_FILE`：本机信任表，默认 `trusted-peers-<NODE_ID>.json`。删掉某个节点条目等于重新信任它的新公钥。
+- `VERIFY_SIGNATURES=0`：关闭签名校验（只用于兼容旧节点或临时排障）。
+- `NODE_CLOCK_SKEW_MS`（默认 60000）/ `REPLAY_TTL_MS`（默认 300000）：签名请求的时钟窗口与 nonce 保留时间。两台机器的时间要大致同步。
+- `TLS_KEY_FILE` / `TLS_CERT_FILE`：同时配置后节点改用 HTTPS；对端 `PEERS` 也要写 `https://`。自签证书需要 `NODE_EXTRA_CA_CERTS` 或系统信任链，否则 fetch 会拒绝。
+
+`sync-check.js` 也能验证来源：把节点公钥导出成 PEM（`/api/identity` 的 `publicKey` 字段）后运行 `node sync-check.js journal.json --pubkey node-a.pem`；签名不通过时退出码非零。
 
 - `test-peer-rotation.js`：两个真实进程轮流担任权威，每个任期后状态哈希收敛。
 - `test-peer-failover.js`：杀掉当前权威，验证幸存者按租约接任、世界继续推进；旧权威重启后收敛为跟随者。第二个用例制造“旧权威存档更新”的局面，验证按更高任期重建、丢弃旧尾巴且不报 `syncFault`。
@@ -119,7 +130,7 @@ curl -X POST http://B机地址:4173/api/journal/verify \\
 node sync-check.js journal.json
 ```
 
-`SYNC_TOKEN` 经普通 HTTP 传输，**只在可信 LAN/VPN 演示**；不可直接暴露到公网。哈希是完整性校验（FNV-1a 64），**不是密码学签名**。租约到期后的接任已经实现（`LEASE_MS` / `TAKEOVER_MS`）；节点签名、TLS、自动分区合并仍未实现。
+事件哈希（FNV-1a 64）只负责发现内容篡改；**来源与授权由 Ed25519 签名负责**。信封签名能证明“这段日志是某把私钥的持有者发的”，但首次接触仍是 TOFU：第一次看到的公钥会被直接固定，所以首次 MITM 仍可能成功。要跨不可信网络，必须同时开 TLS，并把节点公钥通过带外渠道（人工核对指纹）导入信任表。租约到期后的接任已经实现（`LEASE_MS` / `TAKEOVER_MS`）；自动分区合并与拜占庭容错仍未实现。
 
 ## 接入你自己的模型
 

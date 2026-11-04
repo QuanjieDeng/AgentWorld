@@ -3,6 +3,7 @@
 // 权威失联时由轮值里的下一个节点按租约到期接任。单主 → 镜像只作演示/回归。
 
 import http from 'node:http';
+import https from 'node:https';
 import fs from 'node:fs';
 import { timingSafeEqual } from 'node:crypto';
 import path from 'node:path';
@@ -29,6 +30,21 @@ import {
   stateHash,
   resolveTerm,
 } from './sync.js';
+import {
+  ReplayGuard,
+  TrustStore,
+  decodePublicKeyHeader,
+  keyIdFromPublicKey,
+  loadOrCreateIdentity,
+  normalizePublicKey,
+  requestSigningText,
+  signEnvelope,
+  signIdentityDocument,
+  signRequest,
+  verifyEnvelopeSignature,
+  verifyIdentityDocument,
+  verifyText,
+} from './identity.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const PUBLIC = path.join(__dirname, 'public');
@@ -65,6 +81,34 @@ const TAKEOVER_MS = Math.max(
   LEASE_MS * 2,
   Number(process.env.TAKEOVER_MS) || LEASE_MS * 2
 );
+
+// 节点身份：私钥与信任表都只在本机，绝不进存档和事件日志。
+const VERIFY_SIGNATURES = process.env.VERIFY_SIGNATURES !== '0';
+const NODE_KEY_FILE = process.env.NODE_KEY_FILE
+  ? path.resolve(process.env.NODE_KEY_FILE)
+  : path.join(__dirname, `node-key-${NODE_ID.replace(/[^\w.-]/g, '_')}.json`);
+const TRUST_FILE = process.env.TRUST_FILE
+  ? path.resolve(process.env.TRUST_FILE)
+  : path.join(__dirname, `trusted-peers-${NODE_ID.replace(/[^\w.-]/g, '_')}.json`);
+const NODE_CLOCK_SKEW_MS = Math.max(5000, Number(process.env.NODE_CLOCK_SKEW_MS) || 60_000);
+const REPLAY_TTL_MS = Math.max(NODE_CLOCK_SKEW_MS, Number(process.env.REPLAY_TTL_MS) || 300_000);
+
+// 可选 TLS：同时给出证书和私钥就换成 https，对端 URL 也要写 https://。
+const TLS_KEY_FILE = process.env.TLS_KEY_FILE ? path.resolve(process.env.TLS_KEY_FILE) : '';
+const TLS_CERT_FILE = process.env.TLS_CERT_FILE ? path.resolve(process.env.TLS_CERT_FILE) : '';
+const SECURE = !!(TLS_KEY_FILE && TLS_CERT_FILE);
+
+let identity;
+try {
+  identity = loadOrCreateIdentity({ file: NODE_KEY_FILE, nodeId: NODE_ID });
+} catch (err) {
+  console.error(`  节点身份加载失败：${err.message}`);
+  process.exit(1);
+}
+const trust = new TrustStore({ file: TRUST_FILE });
+const replayGuard = new ReplayGuard({ windowMs: NODE_CLOCK_SKEW_MS, ttlMs: REPLAY_TTL_MS });
+// URL -> 对端自报的 nodeId。同一个地址换了身份必须停下来，不能悄悄改写信任关系。
+const peerNodeIds = new Map();
 
 function loadOrCreate() {
   if (!fs.existsSync(SAVE)) return createWorld(SEED);
@@ -211,6 +255,134 @@ function readBody(req) {
   });
 }
 
+/**
+ * 写入请求的授权：bearer token 或节点签名，二者其一。
+ * 签名请求带 timestamp + nonce，先 inspect 再验签再 remember，防止用伪造请求占 nonce。
+ * 返回 publicKey，供后续验证信封签名（写日志的节点必须和签请求的是同一个）。
+ */
+function authPeerRequest(req, body) {
+  if (tokenOk(req)) {
+    // 镜像/单主模式仍用 token 授权，但请求会带节点的自报公钥；
+    // 用它把写入者的钥匙固定下来，后续才能校验它发来的签名日志。
+    const claimedId = String(req.headers['x-node-id'] || '').slice(0, 64);
+    const presented = decodePublicKeyHeader(req.headers['x-node-public-key']);
+    const claimedKeyId = String(req.headers['x-node-key-id'] || '');
+    if (claimedId && presented && keyIdFromPublicKey(presented) === claimedKeyId) {
+      const pin = trust.trust(claimedId, presented);
+      if (pin.ok) return { ok: true, via: 'token', nodeId: claimedId, publicKey: presented };
+    }
+    return { ok: true, via: 'token', nodeId: null, publicKey: null };
+  }
+  if (!VERIFY_SIGNATURES) return { ok: false, status: 401, error: 'unauthorized' };
+
+  const nodeId = String(req.headers['x-node-id'] || '').slice(0, 64);
+  const timestamp = Number(req.headers['x-node-timestamp']);
+  const nonce = String(req.headers['x-node-nonce'] || '');
+  const signature = String(req.headers['x-node-signature'] || '');
+  if (!nodeId || !nonce || !signature || !Number.isFinite(timestamp)) {
+    return { ok: false, status: 401, error: 'unauthorized' };
+  }
+
+  const inspected = replayGuard.inspect({ nodeId, timestamp, nonce });
+  if (!inspected.ok) return { ok: false, status: 401, error: inspected.reason };
+
+  const pinned = trust.get(nodeId);
+  let publicKey = pinned ? pinned.publicKey : '';
+  if (!publicKey) {
+    // 首次接触：只接受随请求自带的公钥，先把“这把钥匙确实签了这次请求”验过再固定。
+    const presented = decodePublicKeyHeader(req.headers['x-node-public-key']);
+    const claimedKeyId = String(req.headers['x-node-key-id'] || '');
+    if (!presented || keyIdFromPublicKey(presented) !== claimedKeyId) {
+      return { ok: false, status: 401, error: 'unknown node key' };
+    }
+    publicKey = presented;
+  }
+
+  const requestPath = new URL(req.url, 'http://localhost').pathname;
+  const text = requestSigningText({
+    method: req.method,
+    path: requestPath,
+    nodeId,
+    timestamp,
+    nonce,
+    body,
+  });
+  if (!verifyText(publicKey, text, signature)) {
+    return { ok: false, status: 401, error: 'bad request signature' };
+  }
+  if (!replayGuard.remember({ nodeId, nonce })) {
+    return { ok: false, status: 401, error: 'replayed request' };
+  }
+
+  const pin = trust.trust(nodeId, publicKey);
+  if (!pin.ok) {
+    console.error(`  ${pin.reason}（已固定 ${pin.pinnedKeyId}，对方出示 ${pin.presentedKeyId}）`);
+    return { ok: false, status: 409, error: pin.reason };
+  }
+  return { ok: true, via: 'signature', nodeId, publicKey };
+}
+
+/**
+ * 请求体里的日志信封如果是签名的，必须由已授权节点签；
+ * peer 模式下强制要求信封签名，token 只用于过渡期的人工导入。
+ */
+function checkEnvelopeSignature(envelope, auth) {
+  if (!VERIFY_SIGNATURES) return { ok: true };
+  const sig = envelope?.signature;
+  if (!sig) {
+    // peer 模式不接受无签名日志；token 只留给镜像/过渡期的人工导入。
+    if (PEER || auth.via === 'signature') {
+      return { ok: false, status: 400, error: 'journal signature required' };
+    }
+    return { ok: true };
+  }
+  const signerId = String(sig.nodeId || '');
+  if (!signerId) return { ok: false, status: 400, error: 'journal signature has no node id' };
+  if (auth.nodeId && signerId !== auth.nodeId) {
+    return { ok: false, status: 403, error: 'journal signed by a different node' };
+  }
+  const pinned = signerId === auth.nodeId ? auth.publicKey : trust.get(signerId)?.publicKey;
+  if (!pinned) return { ok: false, status: 401, error: `unknown journal signer ${signerId}` };
+  if (!verifyEnvelopeSignature(envelope, pinned, { nodeId: signerId })) {
+    return { ok: false, status: 400, error: 'journal signature invalid' };
+  }
+  return { ok: true };
+}
+
+/**
+ * 拉一个对端的身份声明：验自证签名 → 按 nodeId 固定公钥 → 检查地址没换人。
+ * 返回的 publicKey 就是之后验证它日志信封的唯一依据。
+ */
+async function fetchPeerIdentity(peer) {
+  const response = await fetch(`${peer}/api/identity`, { signal: AbortSignal.timeout(5000) });
+  if (!response.ok) throw new Error(`peer identity HTTP ${response.status}`);
+  const doc = await response.json();
+  if (!doc || typeof doc.nodeId !== 'string' || !doc.nodeId) throw new Error('peer identity has no node id');
+
+  const known = peerNodeIds.get(peer);
+  if (known && known !== doc.nodeId) {
+    throw new Error(`conflict: ${peer} changed identity from ${known} to ${doc.nodeId}`);
+  }
+  peerNodeIds.set(peer, doc.nodeId);
+
+  if (!VERIFY_SIGNATURES) return { ...doc, publicKey: doc.publicKey ? normalizePublicKey(doc.publicKey) : null };
+  if (!doc.publicKey || !doc.proof) throw new Error('conflict: peer identity is unsigned');
+  if (!verifyIdentityDocument(doc)) throw new Error('conflict: peer identity proof invalid');
+
+  const pin = trust.trust(doc.nodeId, doc.publicKey);
+  if (!pin.ok) throw new Error(`conflict: ${pin.reason}`);
+  return { ...doc, publicKey: normalizePublicKey(doc.publicKey) };
+}
+
+function verifyPeerEnvelope(envelope, peerIdentity) {
+  if (!VERIFY_SIGNATURES) return { ok: true };
+  if (!peerIdentity?.publicKey) return { ok: false, reason: 'no pinned key for peer' };
+  if (!verifyEnvelopeSignature(envelope, peerIdentity.publicKey, { nodeId: peerIdentity.nodeId })) {
+    return { ok: false, reason: 'journal signature invalid' };
+  }
+  return { ok: true };
+}
+
 // 观看者自己的模型写这段编年史。事实由引擎给，模型只负责叙述。
 async function llmNarrator(context) {
   const lines = context.facts.map((f) => {
@@ -272,12 +444,13 @@ async function handleApi(req, res, url) {
     return json(res, { currentDay: world.day || 1, days: daySummaries(world) });
   }
 
-  // B 阶段地基：导出可交换的日志信封。
+  // B 阶段地基：导出可交换的日志信封，用本节点私钥签名。
   if (url.pathname === '/api/journal') {
     const fromSeq = Math.max(1, Math.floor(Number(url.searchParams.get('fromSeq')) || 1));
     const nodeId = String(url.searchParams.get('nodeId') || NODE_ID).slice(0, 32);
     const epoch = Math.max(1, Math.floor(Number(url.searchParams.get('epoch')) || 1));
-    return json(res, exportJournal(world, { fromSeq, nodeId, epoch }));
+    const envelope = exportJournal(world, { fromSeq, nodeId, epoch });
+    return json(res, signEnvelope(envelope, identity));
   }
 
   // 身份与当前状态哈希：两台机器互相对账用。
@@ -288,7 +461,8 @@ async function handleApi(req, res, url) {
     const authorityLastSeenAt = selfAuthority ? now : nodeLastSeen.get(state.authorityId) || 0;
     const silentFor = Math.max(0, now - authorityLastSeenAt);
     const offset = takeoverOffset(state.authorityId);
-    return json(res, {
+    // 身份声明由本节点私钥自证；对端验过之后会固定这把公钥。
+    const doc = {
       nodeId: NODE_ID,
       seed: world.seed,
       tick: world.tick,
@@ -332,7 +506,8 @@ async function handleApi(req, res, url) {
             error: health.error || '',
           }))
         : [],
-    });
+    };
+    return json(res, signIdentityDocument(identity, doc));
   }
 
   // 手动存档：两机演示和断线重连前先落一次盘。
@@ -342,17 +517,25 @@ async function handleApi(req, res, url) {
   }
 
   // 接收日志块：镜像模式用于演示推送，peer 模式用于手动/测试导入。
+  // 授权：bearer token 或带 nonce 的节点签名；握手期间两者都可以。
   if (url.pathname === '/api/journal/apply') {
     if (!MIRROR && !PEER) {
       return json(res, { ok: false, error: 'journal apply is disabled on standalone nodes' }, 403);
     }
-    if (!SYNC_TOKEN) {
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
       return json(res, { ok: false, error: 'SYNC_TOKEN is required for journal apply' }, 503);
     }
-    if (!tokenOk(req)) {
-      return json(res, { ok: false, error: 'unauthorized' }, 401);
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) {
+      return json(res, { ok: false, error: auth.error }, auth.status);
     }
-    if (body.nodeId && body.nodeId !== NODE_ID) noteNodeSeen(body.nodeId);
+    const envelopeCheck = checkEnvelopeSignature(body, auth);
+    if (!envelopeCheck.ok) {
+      if (PEER && envelopeCheck.status === 400) syncFault = envelopeCheck.error;
+      return json(res, { ok: false, error: envelopeCheck.error }, envelopeCheck.status);
+    }
+    const writerId = auth.nodeId || (body.nodeId && body.nodeId !== NODE_ID ? body.nodeId : '');
+    if (writerId) noteNodeSeen(writerId);
     const result = applyChunk(world, body);
     if (!result.ok) return json(res, { ok: false, ...result }, 400);
     if (!result.matched) {
@@ -403,15 +586,22 @@ async function handleApi(req, res, url) {
   // 这是唯一会丢掉本地未同步尾巴的操作，所以只接受显式调用与 token。
   if (url.pathname === '/api/sync/adopt') {
     if (!PEER) return json(res, { ok: false, error: 'peer mode only' }, 403);
-    if (!SYNC_TOKEN) return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
-    if (!tokenOk(req)) return json(res, { ok: false, error: 'unauthorized' }, 401);
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    }
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) return json(res, { ok: false, error: auth.error }, auth.status);
 
     const peer = String(body.peer || '').trim().replace(/\/+$/, '');
     if (!peer) return json(res, { ok: false, error: 'peer is required' }, 400);
     try {
+      // 先拿到对端身份并固定公钥，再拉日志；否则无法确认日志是谁签的。
+      const peerIdentity = await fetchPeerIdentity(peer);
       const response = await fetch(`${peer}/api/journal`, { signal: AbortSignal.timeout(20_000) });
       if (!response.ok) throw new Error(`peer journal HTTP ${response.status}`);
       const envelope = await response.json();
+      const signatureCheck = verifyPeerEnvelope(envelope, peerIdentity);
+      if (!signatureCheck.ok) throw new Error(`conflict: ${signatureCheck.reason}`);
       const check = verifyJournal(envelope);
       if (!check.ok) return json(res, { ok: false, error: check.reason }, 400);
       if (envelope.seed !== world.seed) return json(res, { ok: false, error: 'seed mismatch' }, 400);
@@ -481,7 +671,7 @@ async function handleApi(req, res, url) {
   return json(res, { ok: false }, 404);
 }
 
-const server = http.createServer((req, res) => {
+const requestHandler = (req, res) => {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
   if (url.pathname === '/stream') {
@@ -522,7 +712,22 @@ const server = http.createServer((req, res) => {
     });
     res.end(data);
   });
-});
+};
+
+let server;
+if (SECURE) {
+  try {
+    server = https.createServer(
+      { key: fs.readFileSync(TLS_KEY_FILE), cert: fs.readFileSync(TLS_CERT_FILE) },
+      requestHandler
+    );
+  } catch (err) {
+    console.error(`  TLS 证书加载失败：${err.message}`);
+    process.exit(1);
+  }
+} else {
+  server = http.createServer(requestHandler);
+}
 
 function broadcast() {
   const msg = `data: ${JSON.stringify(snapshot(world))}\n\n`;
@@ -536,38 +741,40 @@ function broadcast() {
 }
 
 async function syncPeer() {
-  if (PEER || MIRROR || !PEER_URL || !SYNC_TOKEN || world.inflight > 0) return;
+  if (PEER || MIRROR || !PEER_URL || (!SYNC_TOKEN && !VERIFY_SIGNATURES) || world.inflight > 0) return;
 
   try {
-    const identityResponse = await fetch(`${PEER_URL}/api/identity`, {
-      signal: AbortSignal.timeout(5000),
-    });
-    if (!identityResponse.ok) throw new Error(`peer identity HTTP ${identityResponse.status}`);
-    const identity = await identityResponse.json();
-    if (identity.seed !== world.seed) throw new Error('peer seed mismatch');
+    const peerDoc = await fetchPeerIdentity(PEER_URL);
+    if (peerDoc.seed !== world.seed) throw new Error('peer seed mismatch');
 
-    const fromSeq = Math.max(1, Math.floor(Number(identity.events) || 0) + 1);
+    const fromSeq = Math.max(1, Math.floor(Number(peerDoc.events) || 0) + 1);
     if (fromSeq > world.nextSeq) throw new Error('peer is ahead of leader');
 
     const prefix = world.eventLog.filter((e) => e.seq < fromSeq);
     const prefixHash = eventsHash(prefix);
-    if (identity.events > 0 && identity.journalHash !== prefixHash) {
+    if (peerDoc.events > 0 && peerDoc.journalHash !== prefixHash) {
       throw new Error('peer journal diverged before current head');
     }
 
-    const chunk = exportJournal(world, {
-      fromSeq,
-      prevHash: fromSeq > 1 ? prefixHash : null,
-      nodeId: NODE_ID,
-    });
+    const chunk = signEnvelope(
+      exportJournal(world, {
+        fromSeq,
+        prevHash: fromSeq > 1 ? prefixHash : null,
+        nodeId: NODE_ID,
+      }),
+      identity
+    );
     if (!chunk.ready) return;
+
+    const headers = {
+      'Content-Type': 'application/json',
+      ...signRequest(identity, { method: 'POST', path: '/api/journal/apply', body: chunk }),
+    };
+    if (SYNC_TOKEN) headers.Authorization = `Bearer ${SYNC_TOKEN}`;
 
     const response = await fetch(`${PEER_URL}/api/journal/apply`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        Authorization: `Bearer ${SYNC_TOKEN}`,
-      },
+      headers,
       body: JSON.stringify(chunk),
       signal: AbortSignal.timeout(10_000),
     });
@@ -590,9 +797,12 @@ async function syncPeer() {
 // 同任期内出现分叉仍然只报 syncFault，不在这里合并。
 async function adoptPeerJournal(peer) {
   const localTerm = termState().term;
+  const peerDoc = await fetchPeerIdentity(peer);
   const response = await fetch(`${peer}/api/journal`, { signal: AbortSignal.timeout(20_000) });
   if (!response.ok) throw new Error(`peer full journal HTTP ${response.status}`);
   const envelope = await response.json();
+  const signatureCheck = verifyPeerEnvelope(envelope, peerDoc);
+  if (!signatureCheck.ok) throw new Error(`conflict: ${signatureCheck.reason}`);
   const check = verifyJournal(envelope);
   if (!check.ok) throw new Error(`conflict: peer journal ${check.reason}`);
   if (envelope.seed !== world.seed) throw new Error('conflict: peer seed mismatch');
@@ -621,37 +831,34 @@ async function adoptPeerJournal(peer) {
 
 // peer 模式：每个节点都从对端拉缺失日志。谁拉谁都不改变“日志是权威”这条。
 async function pullFromPeer(peer) {
-  const identityResponse = await fetch(`${peer}/api/identity`, {
-    signal: AbortSignal.timeout(5000),
-  });
-  if (!identityResponse.ok) throw new Error(`peer identity HTTP ${identityResponse.status}`);
-  const identity = await identityResponse.json();
+  // 身份先验自证、再固定公钥；后面这块日志的签名必须是同一把钥匙签的。
+  const peerDoc = await fetchPeerIdentity(peer);
   // 拿到身份就算一次真实接触：租约只看这个，不看谁先发起。
   const seenAt = Date.now();
-  noteNodeSeen(identity.nodeId, seenAt);
+  noteNodeSeen(peerDoc.nodeId, seenAt);
   peerHealth.set(peer, {
-    nodeId: identity.nodeId,
+    nodeId: peerDoc.nodeId,
     lastSeenAt: seenAt,
-    term: identity.term,
-    events: identity.events,
+    term: peerDoc.term,
+    events: peerDoc.events,
     error: '',
   });
-  if (identity.seed !== world.seed) throw new Error('conflict: peer seed mismatch');
+  if (peerDoc.seed !== world.seed) throw new Error('conflict: peer seed mismatch');
 
   const localTerm = termState().term;
-  const peerTerm = Number.isInteger(identity.term) ? identity.term : localTerm;
+  const peerTerm = Number.isInteger(peerDoc.term) ? peerDoc.term : localTerm;
 
   const localHead = world.nextSeq - 1;
-  if (identity.events < localHead) {
+  if (peerDoc.events < localHead) {
     // 对端更短、任期却更高：本地尾巴是一段没人接受的旧任期事件。
     if (peerTerm > localTerm) return adoptPeerJournal(peer);
     return { behind: true };
   }
 
-  if (identity.events === localHead) {
+  if (peerDoc.events === localHead) {
     if (peerTerm > localTerm) return adoptPeerJournal(peer);
     // 头部相同却没有同一个状态，说明已经分叉，必须停下来。
-    if (identity.tick === world.tick && identity.stateHash !== stateHash(world)) {
+    if (peerDoc.tick === world.tick && peerDoc.stateHash !== stateHash(world)) {
       throw new Error('conflict: same head but state hash differs');
     }
     return { noop: true };
@@ -664,6 +871,9 @@ async function pullFromPeer(peer) {
   if (!journalResponse.ok) throw new Error(`peer journal HTTP ${journalResponse.status}`);
   const chunk = await journalResponse.json();
   if (!chunk.events?.length) return { noop: true };
+
+  const signatureCheck = verifyPeerEnvelope(chunk, peerDoc);
+  if (!signatureCheck.ok) throw new Error(`conflict: ${signatureCheck.reason}`);
 
   const result = applyChunk(world, chunk);
   if (!result.ok) {
@@ -819,21 +1029,27 @@ for (const signal of ['SIGINT', 'SIGTERM']) {
 }
 
 server.listen(PORT, () => {
+  const scheme = SECURE ? 'https' : 'http';
   console.log(`\n  最后的岛 · ${PEER ? '全节点' : MIRROR ? '镜像节点' : '独立节点'}`);
-  console.log(`  ${NODE_ID} · seed ${world.seed} · http://localhost:${PORT}`);
+  console.log(`  ${NODE_ID} · seed ${world.seed} · ${scheme}://localhost:${PORT}`);
+  console.log(
+    `  身份：${identity.keyId} · 签名${VERIFY_SIGNATURES ? '校验开启' : '校验关闭'} · 信任 ${trust.size()} 个节点`
+  );
   if (PEER) {
     console.log(
       `  peer 模式 · 节点 ${NODES.join(', ')} · 每 ${TERM_EVENTS} 条事件轮换 · 当前第 ${currentTerm()} 任：${authorityFor()}`
     );
     console.log(`  对端：${PEERS.length ? PEERS.join(', ') : '（无，单节点）'}`);
-    if (!SYNC_TOKEN) console.warn('  警告：未配置 SYNC_TOKEN，其他节点无法向本节点写入日志。');
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      console.warn('  警告：既没有 SYNC_TOKEN 也没有签名校验，其他节点无法向本节点写入日志。');
+    }
     syncPeers();
   } else if (PEER_URL && !MIRROR) {
     console.log(`  同步目标：${PEER_URL} · 每 ${SYNC_INTERVAL_MS} ms 轮询`);
     syncPeer();
   }
-  if (MIRROR && !SYNC_TOKEN) {
-    console.error('  警告：镜像节点未配置 SYNC_TOKEN，拒绝日志写入。');
+  if (MIRROR && !SYNC_TOKEN && !VERIFY_SIGNATURES) {
+    console.error('  警告：镜像节点既没有 SYNC_TOKEN 也没有签名校验，拒绝日志写入。');
   }
   console.log('');
 });

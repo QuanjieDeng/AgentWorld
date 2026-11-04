@@ -14,6 +14,14 @@ import { setTimeout as delay } from 'node:timers/promises';
 const SERVER = path.join(import.meta.dirname, 'server.js');
 const TOKEN = 'peer-failover-test-token-0123456789';
 const SEED = '515151';
+
+// 每个节点用自己的密钥文件和信任表；重启时复用同一个密钥，否则信任表会拒绝它。
+function paths(dir, nodeId) {
+  return {
+    keyFile: path.join(dir, `key-${nodeId}.json`),
+    trustFile: path.join(dir, `trust-${nodeId}.json`),
+  };
+}
 // 故意把轮换周期设得很长：接管只可能由租约到期触发，断言才不含糊。
 const TERM_EVENTS = '1000';
 
@@ -28,7 +36,7 @@ async function freePort() {
   return port;
 }
 
-function launch({ port, saveFile, nodeId, peering, syncIntervalMs = 100 }) {
+function launch({ port, saveFile, nodeId, peering, keyFile, trustFile, syncIntervalMs = 100 }) {
   const child = spawn(process.execPath, [SERVER], {
     cwd: path.dirname(SERVER),
     env: {
@@ -37,6 +45,8 @@ function launch({ port, saveFile, nodeId, peering, syncIntervalMs = 100 }) {
       SEED,
       NODE_ID: nodeId,
       SAVE_FILE: saveFile,
+      NODE_KEY_FILE: keyFile,
+      TRUST_FILE: trustFile,
       SYNC_MODE: 'peer',
       NODES: 'peer-a,peer-b',
       PEERS: peering,
@@ -102,8 +112,8 @@ test('权威失联后下一节点接任，旧权威回归后只读', async (t) =
   const saveB = path.join(dir, 'peer-b.json');
 
   const procs = {
-    a: launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB }),
-    b: launch({ port: portB, saveFile: saveB, nodeId: 'peer-b', peering: urlA }),
+    a: launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB, ...paths(dir, 'peer-a') }),
+    b: launch({ port: portB, saveFile: saveB, nodeId: 'peer-b', peering: urlA, ...paths(dir, 'peer-b') }),
   };
   t.after(async () => {
     await stop(procs.a);
@@ -159,9 +169,9 @@ test('权威失联后下一节点接任，旧权威回归后只读', async (t) =
 
     // 4. 旧权威带着旧存档回来：读到更高任期后只读。
     if (victimIsA) {
-      procs.a = launch({ port: victimPort, saveFile: saveA, nodeId: 'peer-a', peering: urlB });
+      procs.a = launch({ port: victimPort, saveFile: saveA, nodeId: 'peer-a', peering: urlB, ...paths(dir, 'peer-a') });
     } else {
-      procs.b = launch({ port: victimPort, saveFile: saveB, nodeId: 'peer-b', peering: urlA });
+      procs.b = launch({ port: victimPort, saveFile: saveB, nodeId: 'peer-b', peering: urlA, ...paths(dir, 'peer-b') });
     }
 
     const converged = await waitFor(
@@ -220,8 +230,8 @@ test('旧权威的存档比幸存者更新时，按更高任期重建并丢弃�
 
   // B 拉得很慢，制造“A 的存档比 B 的日志新”的局面。
   const procs = {
-    a: launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB, syncIntervalMs: 100 }),
-    b: launch({ port: portB, saveFile: saveB, nodeId: 'peer-b', peering: urlA, syncIntervalMs: 2500 }),
+    a: launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB, syncIntervalMs: 100, ...paths(dir, 'peer-a') }),
+    b: launch({ port: portB, saveFile: saveB, nodeId: 'peer-b', peering: urlA, syncIntervalMs: 2500, ...paths(dir, 'peer-b') }),
   };
   t.after(async () => {
     await stop(procs.a);
@@ -261,7 +271,7 @@ test('旧权威的存档比幸存者更新时，按更高任期重建并丢弃�
     );
 
     // 把 A 带着领先的存档重新拉起来：它必须放弃旧尾巴，跟上更高任期。
-    procs.a = launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB, syncIntervalMs: 100 });
+    procs.a = launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB, syncIntervalMs: 100, ...paths(dir, 'peer-a') });
 
     const converged = await waitFor(
       async () => {
