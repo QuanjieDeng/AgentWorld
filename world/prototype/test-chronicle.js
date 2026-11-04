@@ -9,6 +9,7 @@ import {
   logEvent,
   snapshot,
   serializeWorld,
+  loadWorld,
   TICKS_PER_DAY,
 } from './engine.js';
 import {
@@ -216,4 +217,40 @@ test('摘要与事件段互不依赖：两条路径看到同一批事实', () =>
   const entries = collectChronicleFacts(world, { fromDay: 1, toDay: 1 });
   assert.equal(digestOf(entries), digestOf(entries));
   assert.equal(daySummaries(world)[0].total, entries.length);
+});
+
+test('叙事缓存可以通过 store 跨 world / 跨进程复用', async () => {
+  const world = createWorld(11);
+  turn(world, '阿禾');
+  const store = new Map();
+  let calls = 0;
+
+  const first = await narrate(
+    world,
+    'store-viewer',
+    { fromDay: 1, toDay: 1 },
+    () => {
+      calls++;
+      return '第一次的版本';
+    },
+    { store }
+  );
+  assert.equal(calls, 1);
+  assert.equal(first.narrative, '第一次的版本');
+  assert.equal(store.size, 1);
+
+  // 新 world 有新的内存缓存（WeakMap），但 store 是同一份。
+  const clone = loadWorld(serializeWorld(world));
+  const second = await narrate(
+    clone,
+    'store-viewer',
+    { fromDay: 1, toDay: 1 },
+    () => {
+      throw new Error('store 命中时不应该再调用叙事器');
+    },
+    { store }
+  );
+  assert.equal(second.narrative, '第一次的版本');
+  assert.equal(second.cached, true);
+  assert.equal(calls, 1);
 });

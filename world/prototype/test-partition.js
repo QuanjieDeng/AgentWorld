@@ -260,10 +260,14 @@ test('断网后两边同时写入，愈合后以更高任期为准，并可由�
       console.log(`after heal:\n${JSON.stringify({ ia: healedA, ib: healedB }, null, 2)}`);
     }
 
-    // 旧权威分区期间写的事件不可能被保留：这是有损的，必须有痕迹。
+    // 旧权威分区期间写的事件不可能被保留。自动采纳时必须记录丢弃条数；
+    // 如果本进程启动后写过事件，则应当拒绝静默丢弃，留下分区停写标记。
     const adoption = healed.low.lastAdoption || healed.high.lastAdoption;
-    assert.ok(adoption, '应当记录一次“以更高任期重建”的采纳');
-    assert.ok(adoption.dropped > 0, '旧权威分区期间的事件应当被明确记为丢弃');
+    const partitionFault = [healed.ia, healed.ib].some((x) =>
+      /partition:/.test(x.syncFault || '')
+    );
+    assert.ok(adoption || partitionFault, '分区愈合后应当留下丢弃记录或分区停写标记');
+    if (adoption) assert.ok(adoption.dropped > 0, '如果自动采纳，必须记录丢弃条数');
     assert.ok(
       healed.ia.syncFault || healed.ib.syncFault,
       '分区愈合后应当至少有一侧停写并等待人工确认'

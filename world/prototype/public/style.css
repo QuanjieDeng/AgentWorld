@@ -73,6 +73,7 @@ header {
 
 .sync-status[data-state="ok"] { color: #8fb98a; }
 .sync-status[data-state="error"] { color: #d98b82; }
+.lang-btn { padding: 2px 7px; font-size: 10px; border-radius: 4px; letter-spacing: 0.08em; }
 
 .controls { display: flex; gap: 6px; }
 
@@ -502,6 +503,15 @@ input::placeholder { color: #4e574f; }
 .remembrance { font-size: 11px; color: #8b958c; margin: 8px 0 2px; }
 .remembrance .low { color: #c08b4a; }
 .remembrance .gone { color: #a45c55; }
+.shallow-btn {
+  display: block;
+  margin-top: 8px;
+  padding: 5px 10px;
+  font-size: 11px;
+  color: #c9b26a;
+  border-color: #4a4433;
+}
+.shallow-btn.report { color: #a45c55; border-color: #4a3333; }
 
 details.panel summary {
   cursor: pointer;
@@ -512,6 +522,28 @@ details.panel summary {
 }
 details.panel summary::-webkit-details-marker { display: none; }
 details.panel[open] summary { margin-bottom: 8px; }
+
+dialog {
+  background: var(--panel);
+  color: var(--ink);
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  padding: 18px 20px 20px;
+  width: min(440px, 92vw);
+  max-height: 88vh;
+  overflow-y: auto;
+}
+dialog::backdrop { background: rgba(0, 0, 0, 0.62); }
+dialog h2 { margin: 0; }
+dialog label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--muted);
+  letter-spacing: 0.08em;
+}
+dialog .return-head { display: flex; align-items: center; justify-content: space-between; }
 
 @media (max-width: 980px) {
   #app { flex-direction: column; height: auto; }

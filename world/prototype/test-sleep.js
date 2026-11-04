@@ -19,6 +19,7 @@ import {
 } from './engine.js';
 import { processBrains } from './brain.js';
 import { exportJournal, rebuildFromJournal, applyChunk, cloneWorld, stateHash } from './sync.js';
+import { mineArrival } from './arrival.js';
 
 const SERVER = path.join(import.meta.dirname, 'server.js');
 
@@ -162,6 +163,10 @@ function launch({ port, dir }) {
       SPEED: '8',
       TENDER_TTL_MS: '800',
       PRESENCE_LEASE_TICKS: '20',
+      ARRIVAL_DIFFICULTY: '2',
+      SHALLOW_LEASE_TICKS: '8',
+      // 测试不启动自动提案，否则主人循环会在浅睡结束后立刻把租约续成 owner-online。
+      OWNER_INTENT_INTERVAL_MS: '60000',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -190,6 +195,119 @@ async function getState(port) {
   if (!res.ok) throw new Error(`state HTTP ${res.status}`);
   return res.json();
 }
+
+function launchPeer({ port, dir, nodeId, peering }) {
+  const child = spawn(process.execPath, [SERVER], {
+    cwd: path.dirname(SERVER),
+    env: {
+      ...process.env,
+      PORT: String(port),
+      SEED: '929292',
+      NODE_ID: nodeId,
+      SAVE_FILE: path.join(dir, `${nodeId}.json`),
+      NODE_KEY_FILE: path.join(dir, `key-${nodeId}.json`),
+      TRUST_FILE: path.join(dir, `trust-${nodeId}.json`),
+      SYNC_MODE: 'peer',
+      NODES: 'peer-a,peer-b',
+      PEERS: peering,
+      SYNC_TOKEN: 'sleep-peer-token',
+      TERM_EVENTS: '100000',
+      LEASE_MS: '6000',
+      TAKEOVER_MS: '12000',
+      SYNC_INTERVAL_MS: '100',
+      HANDOFF_SETTLE_MS: '250',
+      SAVE_INTERVAL_MS: '2000',
+      SPEED: '1',
+    },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  let output = '';
+  child.stdout.on('data', (chunk) => (output += chunk.toString()));
+  child.stderr.on('data', (chunk) => (output += chunk.toString()));
+  child.testOutput = () => output;
+  return child;
+}
+
+async function identity(port) {
+  const res = await fetch(`http://127.0.0.1:${port}/api/identity`, {
+    signal: AbortSignal.timeout(2000),
+  });
+  if (!res.ok) throw new Error(`identity HTTP ${res.status}`);
+  return res.json();
+}
+
+test('跟随节点上的观看者守望会转发给权威，两边一致', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'last-island-sleep-peer-'));
+  const portA = await freePort();
+  const portB = await freePort();
+  const urlA = `http://127.0.0.1:${portA}`;
+  const urlB = `http://127.0.0.1:${portB}`;
+  const a = launchPeer({ port: portA, dir, nodeId: 'peer-a', peering: urlB });
+  const b = launchPeer({ port: portB, dir, nodeId: 'peer-b', peering: urlA });
+  t.after(async () => {
+    await stop(a);
+    await stop(b);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const dump = () => `peer-a:\n${a.testOutput()}\npeer-b:\n${b.testOutput()}`;
+
+  try {
+    await waitFor(
+      async () => {
+        const ia = await identity(portA);
+        const ib = await identity(portB);
+        return ia.canWrite && ib.authorityId === 'peer-a' ? { ia, ib } : null;
+      },
+      { detail: dump }
+    );
+
+    const state = await getState(portA);
+    const target = state.agents.find((x) => x.alive && !x.arrivedBy);
+    assert.ok(target, '应当有一个初始居民');
+
+    const tend = await fetch(`${urlB}/api/presence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ viewerId: 'forward-viewer', agentId: target.id }),
+    });
+    const tendBody = await tend.json();
+    assert.equal(tend.status, 200, JSON.stringify(tendBody));
+    assert.equal(tendBody.forwarded, true);
+    assert.equal(tendBody.presence, 'online');
+
+    const online = await waitFor(
+      async () => {
+        const [sa, sb] = await Promise.all([getState(portA), getState(portB)]);
+        const aa = sa.agents.find((x) => x.id === target.id);
+        const bb = sb.agents.find((x) => x.id === target.id);
+        return aa.presence === 'online' && bb.presence === 'online' ? { sa, sb } : null;
+      },
+      { detail: dump }
+    );
+    assert.equal(online.sa.agents.find((x) => x.id === target.id).presenceReason, 'tend');
+
+    const leave = await fetch(`${urlB}/api/presence`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ viewerId: 'forward-viewer', agentId: null }),
+    });
+    assert.equal(leave.status, 200);
+
+    await waitFor(
+      async () => {
+        const [sa, sb] = await Promise.all([getState(portA), getState(portB)]);
+        return sa.agents.find((x) => x.id === target.id).presence === 'offline' &&
+          sb.agents.find((x) => x.id === target.id).presence === 'offline'
+          ? true
+          : null;
+      },
+      { detail: dump }
+    );
+  } catch (err) {
+    err.message += `\n${dump()}`;
+    throw err;
+  }
+});
 
 test('守望心跳让人醒着，心跳失效后自动睡回去', async (t) => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'last-island-sleep-'));
@@ -258,6 +376,79 @@ test('守望心跳让人醒着，心跳失效后自动睡回去', async (t) => {
     assert.equal(leave.status, 200);
     const after = await getState(port);
     assert.equal(after.agents.find((a) => a.id === target.id).presence, 'offline');
+  } catch (err) {
+    err.message += `\n${dump()}`;
+    throw err;
+  }
+});
+
+test('主人可以给自己的居民买浅睡，租约到期后睡回去', async (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'last-island-shallow-'));
+  const port = await freePort();
+  const child = launch({ port, dir });
+  t.after(async () => {
+    await stop(child);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  const base = `http://127.0.0.1:${port}`;
+  const dump = () => child.testOutput();
+
+  try {
+    await waitFor(async () => (await getState(port)) && true, { detail: dump });
+
+    const core = {
+      name: '眠舟',
+      origin: '渔夫',
+      aptitude: '体魄',
+      language: 'south',
+      obsession: '回到海的那一边',
+      wound: '船沉了',
+      voice: '说话像潮水',
+    };
+    const uploaded = await fetch(`${base}/api/arrival`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ core, pow: mineArrival(core, 2) }),
+    });
+    const uploadedBody = await uploaded.json();
+    assert.equal(uploaded.status, 200, JSON.stringify(uploadedBody));
+    const agentId = uploadedBody.agentId;
+
+    const shallow = await fetch(`${base}/api/shallow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId }),
+    });
+    const shallowBody = await shallow.json();
+    assert.equal(shallow.status, 200, JSON.stringify(shallowBody));
+    assert.equal(shallowBody.presence, 'online');
+    assert.equal(shallowBody.presenceReason, 'shallow');
+    assert.ok(shallowBody.presenceUntil > 0);
+
+    const state = await getState(port);
+    const agent = state.agents.find((a) => a.id === agentId);
+    assert.equal(agent.presence, 'online');
+    assert.equal(agent.presenceReason, 'shallow');
+
+    // 不是自己的居民不能买。
+    const other = state.agents.find((a) => !a.arrivedBy && a.alive);
+    const denied = await fetch(`${base}/api/shallow`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: other.id }),
+    });
+    assert.equal(denied.status, 403);
+
+    // SHALLOW_LEASE_TICKS=8，速度 8：约 2.5 秒后租约到期，回到规则驾驶。
+    const asleep = await waitFor(
+      async () => {
+        const s = await getState(port);
+        const a = s.agents.find((x) => x.id === agentId);
+        return a.presence === 'offline' ? s : null;
+      },
+      { timeoutMs: 12_000, detail: dump }
+    );
+    assert.equal(asleep.agents.find((a) => a.id === agentId).presenceReason, null);
   } catch (err) {
     err.message += `\n${dump()}`;
     throw err;

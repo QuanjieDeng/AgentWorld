@@ -106,6 +106,13 @@ export function presenceRecordsFromEvents(events) {
     .map((e) => canonicalEvent(e));
 }
 
+// 上传事件同样要按原序号重放：它会在那个时刻往世界里加一个人。
+export function arrivalRecordsFromEvents(events) {
+  return events
+    .filter((e) => e.type === 'arrival' && e.payload?.arrival?.core)
+    .map((e) => canonicalEvent(e));
+}
+
 /**
  * 从日志解出当前任期与日志权威。排序只看日志字段，不看墙钟：
  *   - 没有 term 事件时，按事件数轮换：term = floor(序号 / TERM_EVENTS)；
@@ -164,6 +171,7 @@ export function stateHash(world) {
     nextChronicleId: s.nextChronicleId,
     institutions: s.institutions,
     nextInstitutionId: s.nextInstitutionId,
+    nextAgentId: s.nextAgentId,
     facts: s.facts,
     nextSeq: s.nextSeq,
     nextFactId: s.nextFactId,
@@ -320,8 +328,9 @@ export function rebuildFromJournal(envelope, { until = envelope.toTick } = {}) {
   const turnings = turningsFromEvents(envelope.events).filter((t) => t.t <= target);
   const terms = termRecordsFromEvents(envelope.events).filter((e) => e.t <= target);
   const presences = presenceRecordsFromEvents(envelope.events).filter((e) => e.t <= target);
+  const arrivals = arrivalRecordsFromEvents(envelope.events).filter((e) => e.t <= target);
   const world = createWorld(envelope.seed);
-  replayDecisions(world, decisions, turnings, terms, presences);
+  replayDecisions(world, decisions, turnings, terms, presences, arrivals);
   while (world.tick < target) {
     tick(world);
     processBrains(world);
@@ -377,7 +386,10 @@ export function applyChunk(localWorld, chunk) {
   const presences = presenceRecordsFromEvents(chunk.events).filter(
     (e) => e.seq >= nextSeq && e.t <= chunk.toTick
   );
-  replayDecisions(world, decisions, turnings, terms, presences);
+  const arrivals = arrivalRecordsFromEvents(chunk.events).filter(
+    (e) => e.seq >= nextSeq && e.t <= chunk.toTick
+  );
+  replayDecisions(world, decisions, turnings, terms, presences, arrivals);
   if (decisions.some((d) => d.tick <= localWorld.tick)) processBrains(world);
   while (world.tick < chunk.toTick) {
     tick(world);
@@ -385,9 +397,19 @@ export function applyChunk(localWorld, chunk) {
   }
   applyRecordedTurnings(world, turnings);
 
+  // 块的最后一条可能是 term / presence / arrival：它要等下一次 logEvent
+  // 才会被插回。比较前必须先收尾，否则单条事件的块永远对不上。
+  flushReplayRecords(world);
   const eventMatch =
     eventsHash(sliceEvents(world, chunk.fromSeq, chunk.toSeq)) === chunk.eventsHash;
   const matched = stateHash(world) === chunk.stateHash && eventMatch;
+  if (!matched && process.env.PEER_DEBUG === '1') {
+    console.log(
+      `  [chunk mismatch] seq ${chunk.fromSeq}-${chunk.toSeq} tick ${chunk.fromTick}-${chunk.toTick} ` +
+        `local tick ${localWorld.tick} events ${chunk.events.length} ` +
+        `types ${[...new Set(chunk.events.map((e) => e.type))].join(',')}`
+    );
+  }
   clearReplay(world);
 
   return { ok: true, world, matched, replayed: true, eventMatch };

@@ -17,11 +17,31 @@ import {
   letterCooldownLeft,
   logTermEvent,
   setPresence,
+  admitArrival,
+  validateArrivalCore,
+  ORIGIN_KEYS,
+  APTITUDE_KEYS,
+  LANGUAGE_KEYS,
+  ARRIVAL_LIMITS,
   MS_PER_TICK,
+  TICKS_PER_DAY,
 } from './engine.js';
+import {
+  ARRIVAL_VERSION,
+  DEFAULT_ARRIVAL_DIFFICULTY,
+  signArrival,
+  verifyArrivalPoW,
+  verifyArrivalRecord,
+} from './arrival.js';
 import { advanceOffline, stepWorld } from './persistence.js';
 import { narrate, defaultNarrator, daySummaries } from './chronicle.js';
-import { requestLLM } from './brain.js';
+import {
+  requestLLM,
+  decideForOwner,
+  queueOwnerIntent,
+  resetOwnerState,
+  sanitizeAction,
+} from './brain.js';
 import {
   exportJournal,
   verifyJournal,
@@ -98,6 +118,114 @@ const REPLAY_TTL_MS = Math.max(NODE_CLOCK_SKEW_MS, Number(process.env.REPLAY_TTL
 // 1 tick = 1 世界分钟；默认租约 300 tick ≈ 现实 12.5 秒。
 const TENDER_TTL_MS = Math.max(1000, Number(process.env.TENDER_TTL_MS) || 15_000);
 const PRESENCE_LEASE_TICKS = Math.max(10, Number(process.env.PRESENCE_LEASE_TICKS) || 300);
+// 主人节点多久替自己的居民想一次下一步；提案过期后权威会照常退回规则。
+const OWNER_INTENT_INTERVAL_MS = Math.max(500, Number(process.env.OWNER_INTENT_INTERVAL_MS) || 2000);
+// 主人“在线”的租约：提案会不断续期；主人不再发提案，租约到期后权威才退回规则。
+const OWNER_LEASE_TICKS = Math.max(10, Number(process.env.OWNER_LEASE_TICKS) || 60);
+// 浅睡：付一次“保管费”换一个世界日的半离线保护（v1 只实现机制，未接支付）。
+const SHALLOW_LEASE_TICKS = Math.max(8, Number(process.env.SHALLOW_LEASE_TICKS) || TICKS_PER_DAY);
+// 离线推进上限：默认最多补 7 个世界日，超出部分只报告 skippedTicks。
+const OFFLINE_MAX_DAYS = Math.max(0, Number(process.env.OFFLINE_MAX_DAYS) || 7);
+// 举报只保存在本机，供人工查看；不进世界日志（避免把举报内容写进不可删除的共享历史）。
+const REPORT_FILE = process.env.REPORT_FILE
+  ? path.resolve(process.env.REPORT_FILE)
+  : path.join(__dirname, `reports-${NODE_ID.replace(/[^\w.-]/g, '_')}.json`);
+
+let reports = [];
+function loadReports() {
+  try {
+    if (!fs.existsSync(REPORT_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(REPORT_FILE, 'utf8'));
+    reports = Array.isArray(data.reports) ? data.reports : [];
+  } catch (err) {
+    console.error(`  举报记录读取失败：${err.message}`);
+    reports = [];
+  }
+}
+function saveReports() {
+  try {
+    const tmp = `${REPORT_FILE}.tmp`;
+    fs.writeFileSync(tmp, `${JSON.stringify({ reports }, null, 2)}\n`);
+    fs.renameSync(tmp, REPORT_FILE);
+  } catch (err) {
+    console.error(`  举报记录写入失败：${err.message}`);
+  }
+}
+function reportCounts() {
+  const counts = {};
+  for (const report of reports) {
+    counts[report.agentId] = (counts[report.agentId] || 0) + 1;
+  }
+  return counts;
+}
+loadReports();
+
+// 叙事缓存跨进程保留：同一观看者 + 同一事件段 + 同一 digest 直接复用，
+// 重启后不必重新调用模型。只在本机，不进共享日志。
+const NARRATIVE_FILE = process.env.NARRATIVE_FILE
+  ? path.resolve(process.env.NARRATIVE_FILE)
+  : path.join(__dirname, `narratives-${NODE_ID.replace(/[^\w.-]/g, '_')}.json`);
+const narrativeStore = new Map();
+let narrativesDirty = false;
+
+function loadNarratives() {
+  try {
+    if (!fs.existsSync(NARRATIVE_FILE)) return;
+    const data = JSON.parse(fs.readFileSync(NARRATIVE_FILE, 'utf8'));
+    for (const [key, value] of Object.entries(data.entries || {})) {
+      narrativeStore.set(key, value);
+    }
+  } catch (err) {
+    console.error(`  叙事缓存读取失败：${err.message}`);
+  }
+}
+
+function trimNarratives() {
+  while (narrativeStore.size > 300) {
+    narrativeStore.delete(narrativeStore.keys().next().value);
+  }
+  narrativesDirty = true;
+}
+
+function saveNarratives() {
+  if (!narrativesDirty || !narrativeStore.size) return;
+  try {
+    const tmp = `${NARRATIVE_FILE}.tmp`;
+    fs.writeFileSync(
+      tmp,
+      `${JSON.stringify({ version: 1, entries: Object.fromEntries(narrativeStore) }, null, 2)}\n`
+    );
+    fs.renameSync(tmp, NARRATIVE_FILE);
+    narrativesDirty = false;
+  } catch (err) {
+    console.error(`  叙事缓存写入失败：${err.message}`);
+  }
+}
+loadNarratives();
+
+// 上传的一次性成本。多节点必须用同一个难度，否则转发会被判 PoW 失败。
+const ARRIVAL_DIFFICULTY = Math.max(
+  1,
+  Math.min(6, Number(process.env.ARRIVAL_DIFFICULTY) || DEFAULT_ARRIVAL_DIFFICULTY)
+);
+// “你只上传一次”：v1 用创建者节点做代理，一个节点只能有一个 arrival 记录。
+const ARRIVAL_ONCE_PER_NODE = process.env.ARRIVAL_ONCE_PER_NODE !== '0';
+
+function hasArrivedFrom(nodeId) {
+  if (!nodeId) return false;
+  return world.eventLog.some(
+    (e) => e.type === 'arrival' && e.payload?.arrival?.creator?.nodeId === nodeId
+  );
+}
+
+// playerId 是浏览器 localStorage 里的随机 id，比节点级限制更接近“一个人一次”，
+// 但可以被清掉重来；节点级仍然是硬限制。
+function hasArrivedFromPlayer(playerId) {
+  if (!playerId) return false;
+  return world.eventLog.some(
+    (e) => e.type === 'arrival' && e.payload?.arrival?.creator?.playerId === playerId
+  );
+}
 
 // 可选 TLS：同时给出证书和私钥就换成 https，对端 URL 也要写 https://。
 const TLS_KEY_FILE = process.env.TLS_KEY_FILE ? path.resolve(process.env.TLS_KEY_FILE) : '';
@@ -126,8 +254,14 @@ function loadOrCreate() {
       loaded.returnSummary = null;
       console.log(`  从存档恢复：第 ${loaded.day} 天 · 等待同步`);
     } else {
-      loaded.returnSummary = advanceOffline(loaded, elapsed);
-      console.log(`  从存档恢复：第 ${loaded.day} 天 · 离线推进 ${loaded.returnSummary.ticks} tick`);
+      loaded.returnSummary = advanceOffline(loaded, elapsed, {
+        maxTicks: TICKS_PER_DAY * OFFLINE_MAX_DAYS,
+      });
+      const skipped = loaded.returnSummary.skippedTicks || 0;
+      console.log(
+        `  从存档恢复：第 ${loaded.day} 天 · 离线推进 ${loaded.returnSummary.ticks} tick` +
+          (skipped ? ` · 跳过 ${skipped} tick（超出 OFFLINE_MAX_DAYS）` : '')
+      );
     }
     return loaded;
   } catch (err) {
@@ -138,6 +272,10 @@ function loadOrCreate() {
 
 let world = loadOrCreate();
 world.config.speed = SPEED;
+// 本进程启动时的日志头。之后新写的事件如果在分区愈合时被静默丢弃，
+// 说明它们已经给观看者看过——这种情况必须人工确认，不能自动采纳。
+const STARTUP_SEQ = world.nextSeq - 1;
+const ALLOW_LIVE_ADOPT = process.env.ALLOW_LIVE_ADOPT === '1';
 const clients = new Set();
 
 let lastSyncAt = 0;
@@ -162,6 +300,10 @@ const peerHealth = new Map(); // url -> { nodeId, lastSeenAt, term, events, erro
 // viewerId -> { agentId, at }。这是本机观看者的守望，不跨节点同步；
 // 只有当前权威会把它翻译成日志里的 presence 事件。
 const tenders = new Map();
+// 历史态按天缓存：过去的事件不会再变，直到世界被整体重建。
+const historyCache = new Map();
+// 跟随节点转发来的守望，键是 `${nodeId}:${viewerId}`。只有当前权威会用到。
+const remoteTenders = new Map();
 
 // 轮值日志权威：term 优先取日志里最后一次交接记录，其次由事件数轮换。
 // 所有节点从同一条日志算出同一个排序。
@@ -223,6 +365,18 @@ function activeTenders(now = Date.now()) {
     }
     if (!active.has(agent.id)) active.set(agent.id, viewerId);
   }
+  for (const [key, tender] of remoteTenders) {
+    if (now - tender.at > TENDER_TTL_MS) {
+      remoteTenders.delete(key);
+      continue;
+    }
+    const agent = world.agents.find((a) => a.id === tender.agentId && a.alive && !a.faded);
+    if (!agent) {
+      remoteTenders.delete(key);
+      continue;
+    }
+    if (!active.has(agent.id)) active.set(agent.id, tender.viewerId);
+  }
   return active;
 }
 
@@ -244,7 +398,12 @@ function reconcilePresence(now = Date.now()) {
         });
         if (event) written++;
       }
-    } else if (agent.presence === 'online') {
+    } else if (
+      agent.presence === 'online' &&
+      agent.presenceReason !== 'owner-online' &&
+      agent.presenceReason !== 'shallow'
+    ) {
+      // 主人提案和浅睡都有自己的租约，守望的心跳不能把它们关掉。
       const event = setPresence(world, agent, { online: false, reason: 'no-tender' });
       if (event) written++;
     }
@@ -497,6 +656,296 @@ async function handleApi(req, res, url) {
     return json(res, { ok: true, heard, cooldownLeft: letterCooldownLeft(world, a) });
   }
 
+  // 上传：新居民唯一的入口。GET 给表单用，POST 先验字段与 PoW，
+  // 再由本节点签名；不是权威就带着签名记录转发给当前权威。
+  if (url.pathname === '/api/arrival' && req.method === 'GET') {
+    return json(res, {
+      ok: true,
+      version: ARRIVAL_VERSION,
+      difficulty: ARRIVAL_DIFFICULTY,
+      origins: ORIGIN_KEYS,
+      aptitudes: APTITUDE_KEYS,
+      languages: LANGUAGE_KEYS,
+      limits: ARRIVAL_LIMITS,
+      oncePerNode: ARRIVAL_ONCE_PER_NODE,
+      hasUploaded: ARRIVAL_ONCE_PER_NODE && hasArrivedFrom(NODE_ID),
+      canWrite: canWriteLocally(),
+      authorityId: authorityFor(),
+      notice: '日志只追加、不可删除。请不要写任何可以辨认真实他人的信息。',
+    });
+  }
+
+  if (url.pathname === '/api/arrival' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    const checked = validateArrivalCore(body.core || body.fields || body);
+    if (!checked.ok) return json(res, { ok: false, error: checked.reason }, 400);
+    if (!verifyArrivalPoW(checked.core, body.pow, ARRIVAL_DIFFICULTY)) {
+      return json(res, { ok: false, error: 'proof of work failed' }, 400);
+    }
+    const playerId = String(body.playerId || body.viewerId || '').slice(0, 64) || null;
+    if (ARRIVAL_ONCE_PER_NODE && hasArrivedFrom(NODE_ID)) {
+      return json(res, { ok: false, error: '这个节点已经上传过一次了' }, 409);
+    }
+    if (playerId && hasArrivedFromPlayer(playerId)) {
+      return json(res, { ok: false, error: '这个玩家已经上传过一个人了' }, 409);
+    }
+
+    const record = signArrival(identity, checked.core, body.pow, { playerId });
+    if (canWriteLocally()) {
+      const result = admitArrival(world, record);
+      if (!result.ok) return json(res, { ok: false, error: result.reason }, 409);
+      saveWorld();
+      broadcast();
+      return json(res, {
+        ok: true,
+        agentId: result.agent.id,
+        name: result.agent.name,
+        tick: world.tick,
+        events: world.nextSeq - 1,
+        creator: identity.nodeId,
+      });
+    }
+
+    if (PEER) {
+      const authorityId = authorityFor();
+      const target = [...peerHealth.entries()].find(([, health]) => health.nodeId === authorityId)?.[0];
+      if (!target) {
+        return json(
+          res,
+          { ok: false, error: 'current authority is not reachable', authorityId },
+          503
+        );
+      }
+      try {
+        const headers = {
+          'Content-Type': 'application/json',
+          ...signRequest(identity, {
+            method: 'POST',
+            path: '/api/arrival/publish',
+            body: record,
+          }),
+        };
+        const response = await fetch(`${target}/api/arrival/publish`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(record),
+          signal: AbortSignal.timeout(10_000),
+        });
+        const out = await response.json();
+        return json(res, out, response.status);
+      } catch (err) {
+        return json(res, { ok: false, error: String(err?.message || err) }, 502);
+      }
+    }
+
+    return json(
+      res,
+      { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+      409
+    );
+  }
+
+  // 内部入口：别的节点把已经签过名的 arrival 记录交给当前权威。
+  if (url.pathname === '/api/arrival/publish' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    }
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) return json(res, { ok: false, error: auth.error }, auth.status);
+
+    const checked = verifyArrivalRecord(body, ARRIVAL_DIFFICULTY);
+    if (!checked.ok) return json(res, { ok: false, error: checked.reason }, 400);
+    if (ARRIVAL_ONCE_PER_NODE && hasArrivedFrom(body.creator?.nodeId)) {
+      return json(res, { ok: false, error: '这个节点已经上传过一次了' }, 409);
+    }
+    if (checked.playerId && hasArrivedFromPlayer(checked.playerId)) {
+      return json(res, { ok: false, error: '这个玩家已经上传过一个人了' }, 409);
+    }
+    if (!canWriteLocally()) {
+      return json(
+        res,
+        { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+        409
+      );
+    }
+
+    const result = admitArrival(world, body);
+    if (!result.ok) return json(res, { ok: false, error: result.reason }, 409);
+    saveWorld();
+    broadcast();
+    return json(res, {
+      ok: true,
+      agentId: result.agent.id,
+      name: result.agent.name,
+      tick: world.tick,
+      events: world.nextSeq - 1,
+      creator: body.creator?.nodeId || null,
+    });
+  }
+
+  // 主人节点提交一个已经想好的动作。权威重新做一遍受控解析后排队，
+  // 到这个人下一次真正要决策时再写进决策日志（source: owner）。
+  if (url.pathname === '/api/intent' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    }
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) return json(res, { ok: false, error: auth.error }, auth.status);
+
+    const agent = world.agents.find(
+      (a) => a.id === String(body.agentId || '') && a.alive && !a.faded
+    );
+    if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+    if (!agent.arrivedBy || agent.arrivedBy !== auth.nodeId) {
+      return json(res, { ok: false, error: 'not your resident' }, 403);
+    }
+    if (!canWriteLocally()) {
+      return json(
+        res,
+        { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+        409
+      );
+    }
+
+    const action = sanitizeAction(world, agent, body.action);
+    if (!action) return json(res, { ok: false, error: 'invalid action' }, 400);
+
+    queueOwnerIntent(agent.id, {
+      action,
+      from: auth.nodeId,
+      basedOnTick: Number(body.basedOnTick) || world.tick,
+    });
+    // 主人还在发提案，就说明他在线：顺手续上清醒租约。
+    if (
+      agent.presence !== 'online' ||
+      agent.presenceReason !== 'owner-online' ||
+      (agent.presenceUntil || 0) - world.tick <= Math.floor(OWNER_LEASE_TICKS / 2)
+    ) {
+      setPresence(world, agent, {
+        online: true,
+        untilTick: world.tick + OWNER_LEASE_TICKS,
+        by: auth.nodeId,
+        reason: 'owner-online',
+      });
+    }
+    return json(res, {
+      ok: true,
+      queued: true,
+      agentId: agent.id,
+      tick: world.tick,
+      presence: agent.presence,
+    });
+  }
+
+  // 浅睡：给自己的居民买一个世界日的半离线保护。v1 只实现机制，
+  // 支付是外部闸门（真实产品里由“保管服务”收费后发放凭证）。
+  if (url.pathname === '/api/shallow' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    const agentId = String(body.agentId || '').slice(0, 32);
+    const agent = world.agents.find((a) => a.id === agentId && a.alive && !a.faded);
+    if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+    if (agent.arrivedBy !== NODE_ID) {
+      return json(res, { ok: false, error: 'only the owner node can buy shallow sleep' }, 403);
+    }
+
+    if (canWriteLocally()) {
+      setPresence(world, agent, {
+        online: true,
+        untilTick: world.tick + SHALLOW_LEASE_TICKS,
+        by: NODE_ID,
+        reason: 'shallow',
+      });
+      saveWorld();
+      broadcast();
+      return json(res, {
+        ok: true,
+        agentId: agent.id,
+        presence: agent.presence,
+        presenceReason: agent.presenceReason,
+        presenceUntil: agent.presenceUntil,
+        leaseTicks: SHALLOW_LEASE_TICKS,
+        note: 'v1 只实现浅睡机制，支付是外部闸门',
+      });
+    }
+
+    if (PEER) {
+      const authorityId = authorityFor();
+      const target = [...peerHealth.entries()].find(([, health]) => health.nodeId === authorityId)?.[0];
+      if (target) {
+        try {
+          const payload = { agentId };
+          const headers = {
+            'Content-Type': 'application/json',
+            ...signRequest(identity, {
+              method: 'POST',
+              path: '/api/shallow/publish',
+              body: payload,
+            }),
+          };
+          const response = await fetch(`${target}/api/shallow/publish`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(8000),
+          });
+          const out = await response.json();
+          return json(res, out, response.status);
+        } catch (err) {
+          return json(res, { ok: false, error: String(err?.message || err) }, 502);
+        }
+      }
+    }
+    return json(
+      res,
+      { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+      409
+    );
+  }
+
+  if (url.pathname === '/api/shallow/publish' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    }
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) return json(res, { ok: false, error: auth.error }, auth.status);
+    if (!canWriteLocally()) {
+      return json(
+        res,
+        { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+        409
+      );
+    }
+    const agent = world.agents.find(
+      (a) => a.id === String(body.agentId || '') && a.alive && !a.faded
+    );
+    if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+    if (agent.arrivedBy !== auth.nodeId) {
+      return json(res, { ok: false, error: 'not your resident' }, 403);
+    }
+
+    setPresence(world, agent, {
+      online: true,
+      untilTick: world.tick + SHALLOW_LEASE_TICKS,
+      by: auth.nodeId,
+      reason: 'shallow',
+    });
+    saveWorld();
+    broadcast();
+    return json(res, {
+      ok: true,
+      forwarded: true,
+      agentId: agent.id,
+      presence: agent.presence,
+      presenceReason: agent.presenceReason,
+      presenceUntil: agent.presenceUntil,
+      leaseTicks: SHALLOW_LEASE_TICKS,
+      note: 'v1 只实现浅睡机制，支付是外部闸门',
+    });
+  }
+
   // 观看者的守望心跳。agentId 为空表示“我不再看任何人了”。
   // 这里不写日志；只有当前权威的下一个 reconcilePresence 才把它翻译成 presence 事件。
   if (url.pathname === '/api/presence') {
@@ -516,6 +965,34 @@ async function handleApi(req, res, url) {
 
     const wrote = reconcilePresence();
     if (!canWriteLocally()) {
+      // 跟随节点：把守望转发给当前权威，否则观看者连接的那个节点永远不会写日志。
+      if (PEER) {
+        const authorityId = authorityFor();
+        const target = [...peerHealth.entries()].find(([, health]) => health.nodeId === authorityId)?.[0];
+        if (target) {
+          try {
+            const payload = { viewerId, agentId: agentId || null };
+            const headers = {
+              'Content-Type': 'application/json',
+              ...signRequest(identity, {
+                method: 'POST',
+                path: '/api/presence/forward',
+                body: payload,
+              }),
+            };
+            const response = await fetch(`${target}/api/presence/forward`, {
+              method: 'POST',
+              headers,
+              body: JSON.stringify(payload),
+              signal: AbortSignal.timeout(5000),
+            });
+            const out = await response.json();
+            return json(res, out, response.status);
+          } catch (err) {
+            return json(res, { ok: false, error: String(err?.message || err) }, 502);
+          }
+        }
+      }
       return json(
         res,
         {
@@ -533,9 +1010,77 @@ async function handleApi(req, res, url) {
       presence: agent ? agent.presence : null,
       presenceUntil: agent ? agent.presenceUntil || 0 : 0,
       leaseTicks: PRESENCE_LEASE_TICKS,
-      tenders: tenders.size,
+      tenders: tenders.size + remoteTenders.size,
       wrote,
     });
+  }
+
+  // 权威接收跟随节点转发来的守望。viewerId 由转发节点提供，按节点隔离。
+  if (url.pathname === '/api/presence/forward' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    }
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) return json(res, { ok: false, error: auth.error }, auth.status);
+    if (!canWriteLocally()) {
+      return json(
+        res,
+        { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+        409
+      );
+    }
+
+    const viewerId = String(body.viewerId || '').slice(0, 64);
+    if (!viewerId) return json(res, { ok: false, error: 'viewerId is required' }, 400);
+    const key = `${auth.nodeId}:${viewerId}`;
+    const agentId = body.agentId ? String(body.agentId).slice(0, 32) : '';
+    let agent = null;
+    if (agentId) {
+      agent = world.agents.find((a) => a.id === agentId && a.alive && !a.faded);
+      if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+      remoteTenders.set(key, { agentId, at: Date.now(), from: auth.nodeId, viewerId });
+    } else {
+      remoteTenders.delete(key);
+    }
+
+    const wrote = reconcilePresence();
+    return json(res, {
+      ok: true,
+      forwarded: true,
+      agentId: agentId || null,
+      presence: agent ? agent.presence : null,
+      presenceUntil: agent ? agent.presenceUntil || 0 : 0,
+      leaseTicks: PRESENCE_LEASE_TICKS,
+      wrote,
+    });
+  }
+
+  // 历史态：从日志重放到那一天，返回当时的地图、居民、建筑和野兽。
+  // 过去的事件不会再变，所以按天缓存；世界被整体重建时清空。
+  if (url.pathname === '/api/history') {
+    const currentDay = world.day || 1;
+    const requested = Math.max(1, Math.floor(Number(url.searchParams.get('day')) || currentDay));
+    const day = Math.min(requested, currentDay);
+    const cached = historyCache.get(day);
+    if (cached) return json(res, { ...cached, cached: true });
+
+    const target = Math.max(480, (day - 1) * TICKS_PER_DAY + 480);
+    let rebuilt;
+    try {
+      rebuilt = rebuildFromJournal(exportJournal(world, { fromSeq: 1 }), {
+        until: Math.min(target, world.tick),
+      });
+    } catch (err) {
+      return json(res, { ok: false, error: String(err?.message || err) }, 500);
+    }
+    const snap = snapshot(rebuilt);
+    const result = { ...snap, history: true, requestedDay: day };
+    historyCache.set(day, result);
+    if (historyCache.size > 8) {
+      historyCache.delete(historyCache.keys().next().value);
+    }
+    return json(res, result);
   }
 
   if (url.pathname === '/api/timeline') {
@@ -711,7 +1256,10 @@ async function handleApi(req, res, url) {
       if (!check.ok) return json(res, { ok: false, error: check.reason }, 400);
       if (envelope.seed !== world.seed) return json(res, { ok: false, error: 'seed mismatch' }, 400);
       const remoteTerm = resolveTerm(envelope.events, { nodes: NODES, termEvents: TERM_EVENTS }).term;
-      if (remoteTerm < currentTerm()) {
+      // 默认只接受不落后于本地的任期；force 用于“日志全量重新引导”：
+      // 本地存档坏了、或需要从某个可信节点整体重建时，由人明确指定基准。
+      const force = body.force === true || body.rebootstrap === true;
+      if (!force && remoteTerm < currentTerm()) {
         return json(res, { ok: false, error: `peer term ${remoteTerm} is behind local term ${currentTerm()}` }, 409);
       }
       let rebuilt;
@@ -725,13 +1273,21 @@ async function handleApi(req, res, url) {
       }
       const dropped = Math.max(0, world.nextSeq - 1 - envelope.toSeq);
       world = rebuilt;
+      resetOwnerState();
+      historyCache.clear();
       syncFault = '';
       handoffReady = false;
       handoffStart = 0;
       lastSyncError = '';
       lastSyncAt = Date.now();
       lastSyncedTick = world.tick;
-      lastAdoption = { at: Date.now(), from: peer, term: remoteTerm, dropped, via: 'manual' };
+      lastAdoption = {
+        at: Date.now(),
+        from: peer,
+        term: remoteTerm,
+        dropped,
+        via: force ? 'rebootstrap' : 'manual',
+      };
       return json(res, {
         ok: true,
         tick: world.tick,
@@ -745,6 +1301,50 @@ async function handleApi(req, res, url) {
     }
   }
 
+  // 导出「我的版本」的编年史。每个观看者的叙事不同，所以导出的是本机这份。
+  if (url.pathname === '/api/chronicle/export') {
+    const viewerId = String(body.viewerId || '').slice(0, 64) || null;
+    const fromDay = Math.max(1, Math.floor(Number(body.fromDay) || 1));
+    const toDay = Math.max(fromDay, Math.floor(Number(body.toDay) || fromDay));
+    const range = { fromDay, toDay };
+    let result;
+    if (!world.api.key) {
+      result = await narrate(world, viewerId, range, defaultNarrator, { store: narrativeStore });
+    } else {
+      try {
+        result = await narrate(world, viewerId, range, llmNarrator, { store: narrativeStore });
+      } catch (err) {
+        world.llmErrors = (world.llmErrors || 0) + 1;
+        world.llmLastError = String(err?.message || err);
+        result = await narrate(world, viewerId, range, defaultNarrator, {
+          cache: false,
+          store: narrativeStore,
+        });
+      }
+    }
+    trimNarratives();
+    saveNarratives();
+    const markdown = [
+      '# 最后的岛 · 编年史（我的版本）',
+      '',
+      `观看者：${viewerId || '匿名观看者'}`,
+      `范围：第 ${result.range.fromDay} 天 — 第 ${result.range.toDay} 天`,
+      `生成于：第 ${world.day || 1} 天 ${world.clock || '08:00'}（世界时间）`,
+      '',
+      '> 这是本机观看者自己的版本，不是官方历史。',
+      '',
+      result.narrative || '（这段时间没有可叙述的事。）',
+      '',
+    ].join('\n');
+    return json(res, {
+      ok: true,
+      filename: `island-chronicle-d${result.range.fromDay}-d${result.range.toDay}.md`,
+      markdown,
+      model: !!world.api.key,
+      fallback: false,
+    });
+  }
+
   if (url.pathname === '/api/chronicle') {
     const viewerId = String(body.viewerId || '').slice(0, 64) || null;
     const fromDay = Math.max(1, Math.floor(Number(body.fromDay) || 1));
@@ -752,17 +1352,30 @@ async function handleApi(req, res, url) {
     const range = { fromDay, toDay };
 
     if (!world.api.key) {
-      const result = await narrate(world, viewerId, range, defaultNarrator);
+      const result = await narrate(world, viewerId, range, defaultNarrator, {
+        store: narrativeStore,
+      });
+      trimNarratives();
+      saveNarratives();
       return json(res, { ok: true, ...result, model: false, fallback: false });
     }
 
     try {
-      const result = await narrate(world, viewerId, range, llmNarrator);
+      const result = await narrate(world, viewerId, range, llmNarrator, {
+        store: narrativeStore,
+      });
+      trimNarratives();
+      saveNarratives();
       return json(res, { ok: true, ...result, model: true, fallback: false });
     } catch (err) {
       world.llmErrors = (world.llmErrors || 0) + 1;
       world.llmLastError = String(err?.message || err);
-      const result = await narrate(world, viewerId, range, defaultNarrator, { cache: false });
+      const result = await narrate(world, viewerId, range, defaultNarrator, {
+        cache: false,
+        store: narrativeStore,
+      });
+      trimNarratives();
+      saveNarratives();
       return json(res, { ok: true, ...result, model: true, fallback: true });
     }
   }
@@ -770,6 +1383,32 @@ async function handleApi(req, res, url) {
   if (url.pathname === '/api/config') {
     applyApiConfig(body);
     return json(res, { ok: true, configured: !!world.api.key, llmAgents: world.config.llmAgents });
+  }
+
+  // 本机举报记录：只帮助人工发现“像真人”或冒犯性的上传，不自动惩罚。
+  if (url.pathname === '/api/report' && req.method === 'POST') {
+    const agentId = String(body.agentId || '').slice(0, 32);
+    const agent = world.agents.find((a) => a.id === agentId);
+    if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+    const reason = String(body.reason || '').slice(0, 120);
+    reports.push({
+      agentId,
+      reason,
+      at: Date.now(),
+      viewerId: String(body.viewerId || '').slice(0, 64) || null,
+    });
+    if (reports.length > 2000) reports = reports.slice(-2000);
+    saveReports();
+    return json(res, {
+      ok: true,
+      agentId,
+      count: reportCounts()[agentId] || 0,
+      note: '举报只保存在本机，供人工查看',
+    });
+  }
+
+  if (url.pathname === '/api/reports' && req.method === 'GET') {
+    return json(res, { ok: true, counts: reportCounts(), total: reports.length });
   }
 
   if (url.pathname === '/api/state') {
@@ -800,7 +1439,8 @@ const requestHandler = (req, res) => {
     return;
   }
 
-  const rel = url.pathname === '/' ? '/index.html' : url.pathname;
+  const rel =
+    url.pathname === '/' || url.pathname === '/public' ? '/index.html' : url.pathname;
   const file = path.normalize(path.join(PUBLIC, decodeURIComponent(rel)));
   if (!file.startsWith(PUBLIC)) {
     res.writeHead(403);
@@ -919,6 +1559,17 @@ async function adoptPeerJournal(peer) {
   if (peerTerm <= localTerm) throw new Error('conflict: peer journal has no higher term');
 
   const dropped = Math.max(0, world.nextSeq - 1 - envelope.toSeq);
+  // 掉落的事件里有多少是本进程启动后才写的？有的话，它们可能已经给观看者看过，
+  // 不能静默丢弃。崩溃重启后的旧尾巴（启动前写入）仍然自动采纳；分区愈合
+  // 必须人工确认，走 /api/sync/adopt。
+  const liveNew = Math.max(0, world.nextSeq - 1 - STARTUP_SEQ);
+  if (!ALLOW_LIVE_ADOPT && Math.min(dropped, liveNew) > 0) {
+    syncFault = 'partition: local events were not accepted; run /api/sync/adopt to confirm';
+    throw new Error(
+      'conflict: refusing to silently drop events written after startup (partition); ' +
+        'run /api/sync/adopt with the higher-term peer'
+    );
+  }
   let rebuilt;
   try {
     rebuilt = rebuildFromJournal(envelope);
@@ -930,6 +1581,8 @@ async function adoptPeerJournal(peer) {
   }
 
   world = rebuilt;
+  resetOwnerState();
+  historyCache.clear();
   syncFault = '';
   lastSyncAt = Date.now();
   lastSyncedTick = world.tick;
@@ -1091,6 +1744,95 @@ async function syncPeers() {
   syncing = false;
 }
 
+// 主人节点：替自己上传的居民提前想好动作，签名后交给当前权威。
+// 权威只负责重新校验和记录；这一拍没收到提案就照常走规则。
+const ownerLastSent = new Map();
+let ownerBusy = false;
+
+async function submitOwnerIntents() {
+  if (MIRROR || ownerBusy || world.inflight > 0) return;
+  const owned = world.agents.filter(
+    (a) => a.alive && !a.faded && a.arrivedBy === NODE_ID
+  );
+  if (!owned.length) return;
+
+  let target = '';
+  if (!isAuthority()) {
+    if (!PEER) return;
+    const authorityId = authorityFor();
+    target = [...peerHealth.entries()].find(([, health]) => health.nodeId === authorityId)?.[0] || '';
+    if (!target) return;
+  }
+
+  ownerBusy = true;
+  try {
+    for (const agent of owned) {
+      if (Date.now() - (ownerLastSent.get(agent.id) || 0) < OWNER_INTENT_INTERVAL_MS) continue;
+      // 浅睡期间不要自动发提案，否则会把浅睡立刻续成主人上线。
+      if (
+        agent.presence === 'online' &&
+        agent.presenceReason === 'shallow' &&
+        (agent.presenceUntil || 0) > world.tick
+      ) {
+        continue;
+      }
+      // 等主人的 idle 期间也要继续提案，否则会一直等下去。
+      if (agent.action && agent.action.type !== 'idle') continue;
+      if (agent.deciding) continue;
+      if (world.tick + 12 < (agent.cooldownUntil || 0)) continue;
+
+      ownerLastSent.set(agent.id, Date.now());
+      world.inflight++;
+      let action = null;
+      try {
+        action = await decideForOwner(world, agent);
+      } finally {
+        world.inflight--;
+      }
+      if (!action) continue;
+
+      const payload = { agentId: agent.id, action, basedOnTick: world.tick };
+      if (!target) {
+        // 本机就是权威：直接排队，同时续上清醒租约。
+        queueOwnerIntent(agent.id, { ...payload, from: NODE_ID });
+        if (
+          agent.presence !== 'online' ||
+          agent.presenceReason !== 'owner-online' ||
+          (agent.presenceUntil || 0) - world.tick <= Math.floor(OWNER_LEASE_TICKS / 2)
+        ) {
+          setPresence(world, agent, {
+            online: true,
+            untilTick: world.tick + OWNER_LEASE_TICKS,
+            by: NODE_ID,
+            reason: 'owner-online',
+          });
+        }
+        continue;
+      }
+
+      try {
+        const headers = {
+          'Content-Type': 'application/json',
+          ...signRequest(identity, { method: 'POST', path: '/api/intent', body: payload }),
+        };
+        const response = await fetch(`${target}/api/intent`, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(payload),
+          signal: AbortSignal.timeout(8000),
+        });
+        if (!response.ok) {
+          lastSyncError = `owner intent HTTP ${response.status}`;
+        }
+      } catch (err) {
+        lastSyncError = String(err?.message || err);
+      }
+    }
+  } finally {
+    ownerBusy = false;
+  }
+}
+
 // 24 倍：1 现实小时 = 1 世界日。按真实经过时间累积 tick，和离线推进同一把尺子。
 let lastTickAt = Date.now();
 let tickCarry = 0;
@@ -1127,14 +1869,18 @@ function saveWorld() {
 }
 
 setInterval(saveWorld, SAVE_INTERVAL_MS).unref();
+setInterval(saveNarratives, 30_000).unref();
 // 守望心跳可能在两次点击之间过期；每秒核对一次，权威才会续租或让人睡着。
 setInterval(() => reconcilePresence(), 1000).unref();
+// 上传者节点替自己的居民提案；不是权威时目标是对端，本机是权威时直接排队。
+setInterval(submitOwnerIntents, OWNER_INTENT_INTERVAL_MS).unref();
 if (PEER) setInterval(syncPeers, SYNC_INTERVAL_MS).unref();
 else if (PEER_URL && !MIRROR) setInterval(syncPeer, SYNC_INTERVAL_MS).unref();
 
 for (const signal of ['SIGINT', 'SIGTERM']) {
   process.on(signal, () => {
     saveWorld();
+    saveNarratives();
     process.exit(0);
   });
 }

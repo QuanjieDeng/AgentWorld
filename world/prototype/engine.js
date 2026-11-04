@@ -178,6 +178,16 @@ const APTITUDE_GROWTH = {
   耐心: { teach: 1.4, farm: 1.3, build: 1.1, talk: 1.1 },
 };
 
+// 上传（arrival）只接受这些受控词表。
+export const ORIGIN_KEYS = Object.freeze([...new Set(Object.keys(ORIGIN_PROFILES))]);
+export const APTITUDE_KEYS = Object.freeze(Object.keys(APTITUDE_GROWTH));
+export const ARRIVAL_LIMITS = Object.freeze({
+  name: 8,
+  obsession: 30,
+  wound: 40,
+  voice: 40,
+});
+
 export function growthMultiplier(agent, skill) {
   return APTITUDE_GROWTH[agent.tags.aptitude]?.[skill] ?? 1;
 }
@@ -275,6 +285,7 @@ export function createWorld(seed = 20261102) {
     nextChronicleId: 1,
     institutions: [],
     nextInstitutionId: 1,
+    nextAgentId: CAST.length + 1,
     pendingTurnings: [],
     pendingDecisions: [],
     rng: mulberry32(seed ^ 0x9e3779b9),
@@ -341,6 +352,7 @@ export function createWorld(seed = 20261102) {
       presence: 'offline',
       // 在线租约：world.tick 超过这个值还没续期，就回到规则驾驶。
       presenceUntil: 0,
+      presenceReason: null,
       remembrance: DEFAULT_REMEMBRANCE,
       fadeStage: 0,
       faded: false,
@@ -360,11 +372,187 @@ export function createWorld(seed = 20261102) {
       collapsed: false,
       lastSay: '',
       letter: '',
+      voice: '',
+      arrivedAtTick: null,
+      arrivedBy: null,
     };
   });
 
   logEvent(world, 'birth', '十二个人在岛的中央醒了过来。没有人解释这里是哪里。');
   return world;
+}
+
+// ---------- 上传：从雾里走上一个人 ----------
+// 上传的入口只有 arrival 事件。字段校验放在引擎里，因为它拥有受控词表，
+// 也是重放时唯一能判定“这个人能不能进世界”的地方。
+
+const ARRIVAL_NAME_RE = /^[㐀-鿿A-Za-z0-9·_-]+$/;
+const ARRIVAL_PRIVACY = [
+  { re: /https?:\/\//i, why: '网址' },
+  { re: /www\./i, why: '网址' },
+  { re: /[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}/, why: '邮箱' },
+  { re: /@[A-Za-z0-9_]{2,}/, why: '账号' },
+  { re: /\d{8,}/, why: '长串数字' },
+];
+const ARRIVAL_COLORS = ['#c9a06c', '#8fb8c9', '#c98f8f', '#a9c98f', '#b39bc9', '#d4c07a', '#7fb3a0', '#c99a7a'];
+
+function charLength(value) {
+  return [...String(value || '').trim()].length;
+}
+
+export function normalizeArrivalCore(core) {
+  return {
+    name: String(core?.name || '').trim(),
+    origin: String(core?.origin || '').trim(),
+    aptitude: String(core?.aptitude || '').trim(),
+    language: String(core?.language || '').trim(),
+    obsession: String(core?.obsession || '').trim(),
+    wound: String(core?.wound || '').trim(),
+    voice: String(core?.voice || '').trim(),
+  };
+}
+
+export function validateArrivalCore(raw) {
+  const core = normalizeArrivalCore(raw);
+  if (!core.name || charLength(core.name) > ARRIVAL_LIMITS.name || !ARRIVAL_NAME_RE.test(core.name)) {
+    return { ok: false, reason: `名字只能是 1–${ARRIVAL_LIMITS.name} 个字，不含空格和符号` };
+  }
+  for (const { re, why } of ARRIVAL_PRIVACY) {
+    if (re.test(core.name)) return { ok: false, reason: `请勿上传${why}；日志不可删除` };
+  }
+  if (!ORIGIN_KEYS.includes(core.origin)) return { ok: false, reason: '出身不在受控词表里' };
+  if (!APTITUDE_KEYS.includes(core.aptitude)) return { ok: false, reason: '禀赋不在受控词表里' };
+  if (!LANGUAGE_KEYS.includes(core.language)) return { ok: false, reason: '语言不在受控词表里' };
+
+  for (const [key, label, limit] of [
+    ['obsession', '执念', ARRIVAL_LIMITS.obsession],
+    ['wound', '旧伤', ARRIVAL_LIMITS.wound],
+    ['voice', '口吻', ARRIVAL_LIMITS.voice],
+  ]) {
+    const text = core[key];
+    if (!text) return { ok: false, reason: `${label}不能为空` };
+    if (charLength(text) > limit) return { ok: false, reason: `${label}最多 ${limit} 个字` };
+    if (/[\u0000-\u001f\u007f]/.test(text)) return { ok: false, reason: `${label}含有控制字符` };
+    for (const { re, why } of ARRIVAL_PRIVACY) {
+      if (re.test(text)) return { ok: false, reason: `请勿上传${why}；日志不可删除` };
+    }
+  }
+  return { ok: true, core };
+}
+
+function isFreeForArrival(world, x, y) {
+  if (world.map[y * W + x] !== TILE.GRASS) return false;
+  if (world.agents.some((a) => a.alive && a.x === x && a.y === y)) return false;
+  if (world.structures.some((s) => s.x === x && s.y === y && ['fire', 'shelter', 'wall', 'camp'].includes(s.type))) {
+    return false;
+  }
+  return true;
+}
+
+// 确定性选点：先从中心空地按行扫描，再退到整张岛。
+export function findArrivalSpot(world) {
+  const x0 = Math.floor(W / 2) - 6;
+  const y0 = Math.floor(H / 2) - 6;
+  for (let y = y0; y < y0 + 12; y++) {
+    for (let x = x0; x < x0 + 12; x++) {
+      if (isFreeForArrival(world, x, y)) return [x, y];
+    }
+  }
+  for (let y = 0; y < H; y++) {
+    for (let x = 0; x < W; x++) {
+      if (isFreeForArrival(world, x, y)) return [x, y];
+    }
+  }
+  return [Math.floor(W / 2), Math.floor(H / 2)];
+}
+
+function makeArrivalAgent(world, id, core, x, y, creator) {
+  const num = Number(String(id).slice(1)) || 1;
+  return {
+    id,
+    name: core.name,
+    color: ARRIVAL_COLORS[(num - 1) % ARRIVAL_COLORS.length],
+    x,
+    y,
+    hp: 100,
+    hunger: 70 + ((num * 7) % 20),
+    energy: 80 + ((num * 11) % 20),
+    inventory: { food: 1, wood: 0, stone: 0, weapon: 0 },
+    tags: {
+      origin: core.origin,
+      hometown: ORIGIN_HOMETOWN[core.origin] || '北岸',
+      obsession: core.obsession,
+      aptitude: core.aptitude,
+      wound: core.wound,
+    },
+    skills: { ...BASE_SKILLS, ...(ORIGIN_PROFILES[core.origin]?.skills || {}) },
+    knows: initialKnows(core.origin),
+    learning: {},
+    nativeLanguage: core.language,
+    languages: { [core.language]: true },
+    languageProgress: {},
+    heirId: null,
+    heirKind: null,
+    mentorId: null,
+    inheritedObsession: null,
+    inheritedFrom: null,
+    identity: null,
+    turningPoints: [],
+    maxTurnings: 2 + ((num * 3) % 4),
+    hasProposedInstitution: false,
+    exiledUntil: 0,
+    lastRitualDay: 0,
+    presence: 'offline',
+    presenceUntil: 0,
+    presenceReason: null,
+    remembrance: DEFAULT_REMEMBRANCE,
+    fadeStage: 0,
+    faded: false,
+    reputation: 0,
+    relationships: {},
+    memory: [],
+    beliefs: [],
+    action: null,
+    queuedAction: null,
+    deciding: false,
+    cooldownUntil: 0,
+    alive: true,
+    facing: 'S',
+    useLLM: false,
+    lastAction: '',
+    trace: [],
+    collapsed: false,
+    lastSay: '',
+    letter: '',
+    voice: core.voice,
+    arrivedAtTick: world.tick,
+    arrivedBy: creator?.nodeId || null,
+  };
+}
+
+// 只改状态，不写日志。重放和线上共用这一段，保证落点和属性逐字节一致。
+export function applyArrival(world, record) {
+  const checked = validateArrivalCore(record?.core || record);
+  if (!checked.ok) return checked;
+  const core = checked.core;
+  if (world.agents.some((a) => a.name === core.name)) {
+    return { ok: false, reason: '这个名字已经有人用了' };
+  }
+  const id = `a${Number(world.nextAgentId) || 13}`;
+  world.nextAgentId = (Number(world.nextAgentId) || 13) + 1;
+  const [x, y] = findArrivalSpot(world);
+  const agent = makeArrivalAgent(world, id, core, x, y, record?.creator || null);
+  world.agents.push(agent);
+  return { ok: true, agent, core };
+}
+
+export function admitArrival(world, record) {
+  const applied = applyArrival(world, record);
+  if (!applied.ok) return applied;
+  const event = logEvent(world, 'arrival', `${applied.agent.name}从雾里走上了岛。`, applied.agent.id, {
+    arrival: record,
+  });
+  return { ...applied, event };
 }
 
 function appendEvent(world, entry, { ui = true } = {}) {
@@ -390,7 +578,13 @@ function flushReplayRecords(world) {
         const online = !!event.payload.online;
         agent.presence = online ? 'online' : 'offline';
         agent.presenceUntil = online ? Math.max(0, Number(event.payload.untilTick) || 0) : 0;
+        agent.presenceReason = online ? event.payload.reason || null : null;
         if (online) agent.fadeStage = 0;
+      }
+    } else if (kind === 'arrival') {
+      const applied = applyArrival(world, event.payload?.arrival);
+      if (!applied.ok) {
+        throw new Error(`arrival replay failed at seq ${event.seq}: ${applied.reason}`);
       }
     }
     world.eventLog.push(event);
@@ -1423,6 +1617,8 @@ export function setPresence(
 
   agent.presence = nextOnline ? 'online' : 'offline';
   agent.presenceUntil = nextUntil;
+  // 谁让人醒着：观看者的守望，还是主人节点在发提案。两者都写日志。
+  agent.presenceReason = nextOnline ? reason : null;
   if (nextOnline) agent.fadeStage = 0;
 
   return logEvent(
@@ -1443,6 +1639,7 @@ function expirePresence(world) {
     if (world.tick <= (agent.presenceUntil || 0)) continue;
     agent.presence = 'offline';
     agent.presenceUntil = 0;
+    agent.presenceReason = null;
     if (!replaying) {
       logEvent(world, 'presence', PRESENCE_OFFLINE_TEXT(agent.name), agent.id, {
         agentId: agent.id,
@@ -2234,6 +2431,9 @@ function updateStructures(world) {
 
 export function tick(world) {
   if (world.config.paused) return;
+  // 两次 tick 之间写进日志的事件（上传、清醒租约）必须在下一 tick 的逻辑开始前
+  // 插回状态，否则重放时这个人/这次醒来会晚一拍，状态哈希就对不上。
+  if (world.replay) flushReplayRecords(world);
   world.tick++;
   const minute = world.tick % TICKS_PER_DAY;
   world.day = Math.floor(world.tick / TICKS_PER_DAY) + 1;
@@ -2289,6 +2489,8 @@ function copyEvent(e) {
   const payload = { ...e.payload };
   if (payload.action) payload.action = { ...payload.action };
   if (payload.claim) payload.claim = copyClaim(payload.claim);
+  // 上传记录要完整带进日志/存档，重放时靠它重建这个人。
+  if (payload.arrival) payload.arrival = JSON.parse(JSON.stringify(payload.arrival));
   return { ...e, payload };
 }
 
@@ -2338,6 +2540,7 @@ export function serializeWorld(world) {
       ...(inst.members ? { members: [...inst.members] } : {}),
     })),
     nextInstitutionId: world.nextInstitutionId,
+    nextAgentId: world.nextAgentId,
     log: world.log.map(copyEvent),
     eventLog: world.eventLog.map(copyEvent),
     facts: world.facts.map((f) => ({ ...f })),
@@ -2384,6 +2587,7 @@ export function loadWorld(data) {
       ...(inst.members ? { members: [...inst.members] } : {}),
     })),
     nextInstitutionId: data.nextInstitutionId || 1,
+    nextAgentId: data.nextAgentId || 13,
     pendingTurnings: [],
     log: data.log.map(copyEvent),
     eventLog: data.eventLog.map(copyEvent),
@@ -2414,12 +2618,20 @@ export function loadWorld(data) {
   };
 }
 
-export function replayDecisions(world, decisions, turnings = [], terms = [], presences = []) {
-  // term 与 presence 都不是决策，但都必须按原始序号插回日志。
-  // presence 还要在插回时改状态；term 只占序号。
+export function replayDecisions(
+  world,
+  decisions,
+  turnings = [],
+  terms = [],
+  presences = [],
+  arrivals = []
+) {
+  // term / presence / arrival 都不是决策，但都必须按原始序号插回日志。
+  // presence 改清醒状态，arrival 往世界里加一个人，term 只占序号。
   const records = [
     ...terms.map((e) => ({ kind: 'term', event: JSON.parse(JSON.stringify(e)) })),
     ...presences.map((e) => ({ kind: 'presence', event: JSON.parse(JSON.stringify(e)) })),
+    ...arrivals.map((e) => ({ kind: 'arrival', event: JSON.parse(JSON.stringify(e)) })),
   ].sort((a, b) => a.event.seq - b.event.seq);
 
   world.replay = {
@@ -2464,7 +2676,11 @@ export function snapshot(world) {
       learning: { ...a.learning },
       nativeLanguage: a.nativeLanguage,
       languages: { ...a.languages },
+      voice: a.voice || '',
+      arrivedBy: a.arrivedBy || null,
+      arrivedAtTick: a.arrivedAtTick ?? null,
       presence: a.presence,
+      presenceReason: a.presenceReason || null,
       remembrance: Math.round(a.remembrance ?? DEFAULT_REMEMBRANCE),
       fadeStage: a.fadeStage || 0,
       faded: !!a.faded,

@@ -231,7 +231,7 @@ test('旧权威的存档比幸存者更新时，按更高任期重建并丢弃�
   // B 拉得很慢，制造“A 的存档比 B 的日志新”的局面。
   const procs = {
     a: launch({ port: portA, saveFile: saveA, nodeId: 'peer-a', peering: urlB, syncIntervalMs: 100, ...paths(dir, 'peer-a') }),
-    b: launch({ port: portB, saveFile: saveB, nodeId: 'peer-b', peering: urlA, syncIntervalMs: 2500, ...paths(dir, 'peer-b') }),
+    b: launch({ port: portB, saveFile: saveB, nodeId: 'peer-b', peering: urlA, syncIntervalMs: 5000, ...paths(dir, 'peer-b') }),
   };
   t.after(async () => {
     await stop(procs.a);
@@ -250,7 +250,7 @@ test('旧权威的存档比幸存者更新时，按更高任期重建并丢弃�
       { timeoutMs: 20_000, detail: dump }
     );
 
-    // 等 A 明显领先 B 再杀掉 A，保证重启时 A 的存档更新。
+    // 等 A 明显领先 B 再杀掉 A；先手动落盘，保证重启时存档里确实有那段尾巴。
     await waitFor(
       async () => {
         const [ia, ib] = await Promise.all([identity(portA), identity(portB)]);
@@ -258,6 +258,7 @@ test('旧权威的存档比幸存者更新时，按更高任期重建并丢弃�
       },
       { timeoutMs: 10_000, detail: dump }
     );
+    await fetch(`http://127.0.0.1:${portA}/api/save`, { method: 'POST' });
 
     await stop(procs.a);
 
@@ -287,7 +288,7 @@ test('旧权威的存档比幸存者更新时，按更高任期重建并丢弃�
 
     assert.ok(
       procs.a.testOutput().includes('的日志为准重建'),
-      'A 应当以更高任期重建，而不是等待自己的旧尾巴被接受'
+      `A 应当以更高任期重建，而不是等待自己的旧尾巴被接受\nA output:\n${procs.a.testOutput()}`
     );
     assert.equal(converged.ia.authorityId, 'peer-b');
     assert.equal(converged.ia.canWrite, false);

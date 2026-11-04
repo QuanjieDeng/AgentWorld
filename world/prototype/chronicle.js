@@ -277,15 +277,25 @@ function freezeFacts(entries) {
  * @param range   { fromDay, toDay }
  * @param narrator 注入的叙事器 (context) => string | Promise<string>
  */
-export async function narrate(world, viewerId, range = {}, narrator = defaultNarrator, { cache: useCache = true } = {}) {
+export async function narrate(
+  world,
+  viewerId,
+  range = {},
+  narrator = defaultNarrator,
+  { cache: useCache = true, store = null } = {}
+) {
   const r = normalizeRange(world, range);
   const entries = collectChronicleFacts(world, r);
   const digest = digestOf(entries);
   const key = `${viewerId ?? 'anonymous'}|${r.fromDay}|${r.toDay}|${digest}`;
 
   const cache = cacheFor(world);
-  const hit = useCache ? cache.get(key) : null;
-  if (hit) return { ...hit, cached: true };
+  // store 是跨进程的叙事缓存（本机磁盘）；cache 是当前 world 的内存缓存。
+  const hit = useCache ? cache.get(key) || store?.get(key) : null;
+  if (hit) {
+    if (useCache) cache.set(key, hit);
+    return { ...hit, cached: true };
+  }
 
   const pending = pendingFor(world);
   if (useCache && pending.has(key)) return pending.get(key);
@@ -311,6 +321,7 @@ export async function narrate(world, viewerId, range = {}, narrator = defaultNar
         cached: false,
       });
       if (useCache) cache.set(key, result);
+      if (store) store.set(key, result);
       pending.delete(key);
       return result;
     })

@@ -29,10 +29,19 @@ const dismissReturnBtn = $('dismissReturn');
 const islandPanel = $('islandPanel');
 const selectedPanel = $('selectedPanel');
 const islandBody = $('islandBody');
+const langBtn = $('langBtn');
 const chronicleRange = $('chronicleRange');
 const chronicleBody = $('chronicleBody');
 const narrateBtn = $('narrateBtn');
 const todayBtn = $('todayBtn');
+const exportBtn = $('exportBtn');
+const arrivalBtn = $('arrivalBtn');
+const arrivalDialog = $('arrivalDialog');
+const arrivalForm = $('arrivalForm');
+const arrivalNote = $('arrivalNote');
+const arrivalNotice = $('arrivalNotice');
+const arrivalClose = $('arrivalClose');
+const arrivalSubmit = $('arrivalSubmit');
 
 const TILE_COLORS = ['#16232b', '#2b3630', '#1f2f25', '#3c3c39', '#4b3d34', '#33452b'];
 
@@ -73,9 +82,181 @@ const FACT_LABEL = {
 const RESOURCE_LABEL = { food: '食物', wood: '木头', stone: '石头', weapon: '武器' };
 
 const PARAMS = new URLSearchParams(location.search);
+// 看台：只读、不写、不显示任何控制。`/?public=1` 或 `/public`。
+const PUBLIC_MODE = PARAMS.has('public') || location.pathname === '/public';
+
+// 英文界面外壳。世界文本（居民对话、编年史、制度描述）仍是中文——
+// 这一层只翻译界面标签和状态，给公开看台一个可读的英文入口。
+const LANG = PARAMS.get('lang') || localStorage.getItem('island-lang') || 'zh';
+const EN = {
+  '最后的岛': 'The Last Island',
+  '垂直切片 · 十二个人在废墟上醒来': 'A vertical slice · twelve people wake on the ruins',
+  跟随: 'Follow',
+  全岛: 'Island',
+  暂停: 'Pause',
+  上传一个人: 'Bring someone',
+  时间轴: 'Timeline',
+  今天: 'Today',
+  生成: 'Generate',
+  导出这一版: 'Export this version',
+  大脑: 'Mind',
+  发生了什么: 'What happened',
+  全岛总览: 'Island overview',
+  '编年史 · 我的版本': 'Chronicle · my version',
+  '还没有选中任何人。点地图上的一个人。': 'No one selected. Click someone on the map.',
+  '以祖先的声音写一封信…': "Write a letter in an ancestor's voice…",
+  寄出: 'Send',
+  保存: 'Save',
+  '不配置时，十二个人全由规则驱动，世界照常运行。配置后，前 N 个人改用你的模型思考；编年史也会由你的模型来写。':
+    'Without a model all twelve are rule-driven and the world keeps running. With one, the first N think with your model, and the chronicle is written by it too.',
+  出身: 'Origin',
+  家乡: 'Hometown',
+  执念: 'Obsession',
+  禀赋: 'Aptitude',
+  旧伤: 'Old wound',
+  生命: 'Health',
+  饱食: 'Hunger',
+  体力: 'Energy',
+  食物: 'Food',
+  木头: 'Wood',
+  石头: 'Stone',
+  有武器: 'Armed',
+  被记住: 'Remembered',
+  '已经被世界抹去。': 'Erased by the world.',
+  事实: 'Facts',
+  他的看法: 'Their view',
+  个人史: 'History',
+  '醒着 · 有人守着': 'Awake · watched',
+  '睡着 · 本能': 'Asleep · instinct',
+  主人在线: 'Owner online',
+  浅睡: 'Shallow sleep',
+  已死: 'Dead',
+  继承自: 'Inherited from',
+  '从雾里走上岛 · 上传自': 'Came from the fog · uploaded by',
+  活着: 'Alive',
+  死去: 'Dead',
+  制度: 'Institutions',
+  正在淡出: 'Fading',
+  语言: 'Languages',
+  被记住的人: 'Remembered',
+  改变过的人: 'Changed',
+  从雾里来的人: 'Came from the fog',
+  编年史: 'Chronicle',
+  已经不在了: 'Gone',
+  '还没有人死去。': 'No one has died yet.',
+  '还没有制度。': 'No institutions yet.',
+  '还没有值得记下的事。': 'Nothing worth recording yet.',
+  '还没有人脱变。': 'No one has turned yet.',
+  '还没有人上传。': 'No one has arrived yet.',
+  '正在看第': 'Viewing Day ',
+  '选一天，看那天发生了什么。': 'Pick a day to see what happened.',
+  从雾里走上岛: 'Walk onto the island',
+  关闭: 'Close',
+  名字: 'Name',
+  一句口吻: 'A line of voice',
+  上传: 'Upload',
+  '日志只追加、不可删除。请不要写任何可以辨认真实他人的信息。':
+    'The journal is append-only and cannot be deleted. Do not include information that identifies a real person.',
+  '主人在线 · 等提案': 'Owner online · waiting',
+  主人的模型: "Owner's model",
+  '浅睡 · 不会淡出': "Shallow sleep · won't fade",
+  有人守着: 'Watched',
+  不在了: 'Gone',
+  '有人守着，不会淡出': "Watched, won't fade",
+  '没人看着，按本能活着': 'Unwatched, living by instinct',
+  '浅睡中，不会淡出': "Shallow sleep, won't fade",
+  '主人的模型在驱动': "Driven by the owner's model",
+  '主人在线，在等下一步': 'Owner online, waiting for the next move',
+  渔夫: 'Fisher',
+  农妇: 'Farmer',
+  铁匠: 'Blacksmith',
+  医生: 'Doctor',
+  木匠: 'Carpenter',
+  猎人: 'Hunter',
+  石匠: 'Stonemason',
+  教师: 'Teacher',
+  小城教师: 'Town teacher',
+  青年: 'Youth',
+  少女: 'Girl',
+  流浪者: 'Wanderer',
+  体魄: 'Body',
+  机敏: 'Quick',
+  手艺: 'Craft',
+  口才: 'Speech',
+  耐心: 'Patience',
+  北岸话: 'Northshore',
+  南渡话: 'Southcross',
+  外来话: 'Outlander',
+};
+const EN_RULES = [
+  [/^第 (\d+) 天 · (\d{2}:\d{2})$/, 'Day $1 · $2'],
+  [/^第 (\d+) 天$/, 'Day $1'],
+  [/^正在看第 (\d+) 天 · 点「今天」回到现在$/, 'Viewing Day $1 · click Today to return'],
+  [/^正在看第 (\d+) 天$/, 'Viewing Day $1'],
+  [/^活着 (\d+) \/ (\d+)$/, 'Alive $1 / $2'],
+  [/^被记住 (\d+) \/ 100$/, 'Remembered $1 / 100'],
+  [/^正在淡出（(\d)\/3）$/, 'Fading ($1/3)'],
+];
+const EN_PARTS = [
+  ['跟随：', 'Following: '],
+  ['正在淡出：', 'Fading: '],
+  ['被记住 ', 'Remembered '],
+  [' · 正在淡出（', ' · fading ('],
+  [' · 有人守着，不会淡出', " · watched, won't fade"],
+  [' · 没人看着，按本能活着', ' · unwatched, living by instinct'],
+  [' · 浅睡中，不会淡出', " · shallow sleep, won't fade"],
+  [' · 主人的模型在驱动', " · driven by the owner's model"],
+  [' · 主人在线，在等下一步', ' · owner online, waiting'],
+  ['活着 ', 'Alive '],
+  ['死去 ', 'Dead '],
+  ['制度 ', 'Institutions '],
+  ['正在淡出 ', 'Fading '],
+];
+
+function translateText(raw) {
+  const text = String(raw || '').trim();
+  if (!text) return raw;
+  if (EN[text]) return raw.replace(text, EN[text]);
+  for (const [re, replacement] of EN_RULES) {
+    if (re.test(text)) return raw.replace(text, text.replace(re, replacement));
+  }
+  let out = text;
+  for (const [from, to] of EN_PARTS) out = out.split(from).join(to);
+  return out === text ? raw : raw.replace(text, out);
+}
+
+let translateQueued = false;
+function translateDom() {
+  if (LANG !== 'en') return;
+  const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+  const nodes = [];
+  while (walker.nextNode()) nodes.push(walker.currentNode);
+  for (const node of nodes) {
+    const parent = node.parentElement;
+    if (!parent || ['SCRIPT', 'STYLE', 'CANVAS', 'OPTION'].includes(parent.tagName)) continue;
+    const next = translateText(node.nodeValue);
+    if (next !== node.nodeValue) node.nodeValue = next;
+  }
+  for (const option of document.querySelectorAll('option')) {
+    if (EN[option.textContent]) option.textContent = EN[option.textContent];
+  }
+  for (const input of document.querySelectorAll('input[placeholder]')) {
+    if (EN[input.placeholder]) input.placeholder = EN[input.placeholder];
+  }
+}
+function scheduleTranslate() {
+  if (LANG !== 'en' || translateQueued) return;
+  translateQueued = true;
+  requestAnimationFrame(() => {
+    translateQueued = false;
+    translateDom();
+  });
+}
 
 let state = null;
-let readOnlyMode = false;
+let liveState = null;
+let historyMode = false;
+let readOnlyMode = PUBLIC_MODE;
 let selectedId = PARAMS.get('select') || null;
 let mode = PARAMS.get('mode') === 'island' ? 'island' : 'follow';
 let agentTab = 'facts';
@@ -170,6 +351,16 @@ function formatTicks(ticks) {
   return `${t} 分钟`;
 }
 
+function presenceLabel(a) {
+  if (!a || !a.alive) return '不在了';
+  if (a.presence !== 'online') return '睡着 · 本能';
+  if (a.presenceReason === 'owner-online') {
+    return a.action === 'idle' ? '主人在线 · 等提案' : '主人的模型';
+  }
+  if (a.presenceReason === 'shallow') return '浅睡 · 不会淡出';
+  return '有人守着';
+}
+
 async function refreshSyncStatus() {
   try {
     const res = await fetch('/api/identity');
@@ -206,9 +397,20 @@ async function refreshSyncStatus() {
     } else {
       text = '单机 · 未配置同步';
     }
-    readOnlyMode = info.canWrite === false;
+    readOnlyMode = PUBLIC_MODE || historyMode || info.canWrite === false;
+    if (historyMode) {
+      text = `历史态 · 第 ${state?.day || '?'} 天 · 只读`;
+      status = 'idle';
+    } else if (info.lastAdoption?.dropped > 0) {
+      text += ` · 上次丢弃 ${info.lastAdoption.dropped} 条`;
+      if (status === 'ok') status = 'idle';
+    }
     syncStatusEl.textContent = text;
-    syncStatusEl.title = `${info.nodeId} · seed ${info.seed} · ${text}`;
+    syncStatusEl.title = `${info.nodeId} · seed ${info.seed} · ${text}${
+      info.lastAdoption
+        ? ` · 上次采纳：第 ${info.lastAdoption.term} 任 · 丢弃 ${info.lastAdoption.dropped} 条 · ${info.lastAdoption.via}`
+        : ''
+    }`;
     syncStatusEl.dataset.state = status;
     if (state) updateUI();
   } catch {
@@ -471,7 +673,11 @@ function renderAgentPanel() {
       ${
         a.alive
           ? a.presence === 'online'
-            ? '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">醒着 · 有人守着</span>'
+            ? a.presenceReason === 'owner-online'
+              ? '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">主人在线</span>'
+              : a.presenceReason === 'shallow'
+                ? '<span class="badge" style="color:#c9b26a;border-color:#5a503a">浅睡</span>'
+                : '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">醒着 · 有人守着</span>'
             : '<span class="badge" style="color:#b9b2a0;border-color:#4a4a44">睡着 · 本能</span>'
           : ''
       }
@@ -480,6 +686,7 @@ function renderAgentPanel() {
     </div>
     ${renderLineage(a)}
     ${a.inheritedFrom ? `<div class="lineage">继承自 <span class="me">${escapeHtml(a.inheritedFrom)}</span></div>` : ''}
+    ${a.arrivedBy ? `<div class="lineage">从雾里走上岛 · 上传自 <span class="me">${escapeHtml(a.arrivedBy)}</span></div>` : ''}
     <div class="tags">
       <b>出身</b> ${escapeHtml(a.tags.origin)} · <b>家乡</b> ${escapeHtml(a.tags.hometown || '')}<br>
       <b>执念</b> ${escapeHtml(a.tags.obsession)}<br>
@@ -499,10 +706,26 @@ function renderAgentPanel() {
             a.fadeStage ? ` <span class="low">· 正在淡出（${a.fadeStage}/3）</span>` : ''
           }${
             a.presence === 'online'
-              ? ' · 有人守着，不会淡出'
+              ? a.presenceReason === 'owner-online'
+                ? a.action === 'idle'
+                  ? ' · 主人在线，在等下一步'
+                  : ' · 主人的模型在驱动'
+                : a.presenceReason === 'shallow'
+                  ? ' · 浅睡中，不会淡出'
+                  : ' · 有人守着，不会淡出'
               : ' · 没人看着，按本能活着'
           }`
     }</div>
+    ${
+      !PUBLIC_MODE && !historyMode && a.arrivedBy && a.alive
+        ? `<button type="button" class="shallow-btn" data-shallow="${escapeHtml(a.id)}">浅睡一天（自费）</button>`
+        : ''
+    }
+    ${
+      !PUBLIC_MODE && !historyMode && a.alive
+        ? `<button type="button" class="shallow-btn report" data-report="${escapeHtml(a.id)}">举报</button>`
+        : ''
+    }
     ${a.turningPoints.length
       ? `<div class="turning-list">${a.turningPoints
           .slice(-3)
@@ -567,6 +790,16 @@ function renderIslandPanel() {
         .join('')
     : '<div class="row">还没有制度。</div>';
 
+  const turned = alive
+    .filter((a) => a.turningPoints?.length)
+    .sort(
+      (a, b) =>
+        (b.turningPoints[b.turningPoints.length - 1]?.day || 0) -
+        (a.turningPoints[a.turningPoints.length - 1]?.day || 0)
+    )
+    .slice(0, 6);
+  const arrived = alive.filter((a) => a.arrivedBy);
+
   const chronicle = state.chronicle.length
     ? state.chronicle
         .slice(-6)
@@ -598,10 +831,40 @@ function renderIslandPanel() {
           (a) =>
             `<div class="row"><span class="who">${escapeHtml(a.name)}</span> · ${a.remembrance}${
               a.fadeStage ? ` · 淡出 ${a.fadeStage}/3` : ''
-            }</div>`
+            } · ${escapeHtml(presenceLabel(a))}</div>`
         )
         .join('')}
       ${fading.length ? `<div class="row">正在淡出：${fading.map((a) => escapeHtml(a.name)).join('、')}</div>` : ''}
+    </div>
+    <div class="island-section">
+      <div class="sub">改变过的人</div>
+      ${
+        turned.length
+          ? turned
+              .map((a) => {
+                const t = a.turningPoints[a.turningPoints.length - 1];
+                return `<div class="row"><span class="who">${escapeHtml(a.name)}</span> · 第 ${t.day} 天 · ${escapeHtml(
+                  t.label || ''
+                )}</div>`;
+              })
+              .join('')
+          : '<div class="row">还没有人脱变。</div>'
+      }
+    </div>
+    <div class="island-section">
+      <div class="sub">从雾里来的人</div>
+      ${
+        arrived.length
+          ? arrived
+              .map(
+                (a) =>
+                  `<div class="row"><span class="who">${escapeHtml(a.name)}</span> · 上传自 ${escapeHtml(
+                    a.arrivedBy
+                  )} · ${escapeHtml(presenceLabel(a))}</div>`
+              )
+              .join('')
+          : '<div class="row">还没有人上传。</div>'
+      }
     </div>
     <div class="island-section">
       <div class="sub">制度</div>
@@ -622,7 +885,7 @@ function renderIslandPanel() {
 
 function renderTimeline() {
   if (!state) return;
-  const current = state.day || 1;
+  const current = currentDay();
   const byDay = new Map((timelineData.days || []).map((d) => [d.day, d]));
 
   tlNow.textContent = selectedDay
@@ -670,14 +933,44 @@ async function fetchTimeline() {
   }
 }
 
+async function enterHistory(day) {
+  if (!liveState) return;
+  try {
+    const res = await fetch(`/api/history?day=${day}`);
+    const snap = await res.json();
+    if (!res.ok || snap.ok === false) throw new Error(snap.error || `HTTP ${res.status}`);
+    historyMode = true;
+    readOnlyMode = true;
+    state = snap;
+    document.body.classList.add('history-mode');
+    render();
+    updateUI();
+  } catch (err) {
+    chronicleBody.textContent = `看不了那一天：${String(err?.message || err)}`;
+  }
+}
+
+function exitHistory() {
+  if (!historyMode) return;
+  historyMode = false;
+  readOnlyMode = PUBLIC_MODE;
+  if (liveState) state = liveState;
+  document.body.classList.remove('history-mode');
+  render();
+  updateUI();
+}
+
 function selectDay(day) {
   selectedDay = day;
   renderTimeline();
   loadChronicle(day, day);
+  if (day >= currentDay()) exitHistory();
+  else enterHistory(day);
 }
 
+// 始终返回“现在”的世界日，历史视图下也不变。
 function currentDay() {
-  return (state && state.day) || 1;
+  return (liveState && liveState.day) || (state && state.day) || 1;
 }
 
 function renderChronicle(data) {
@@ -836,7 +1129,7 @@ function updateUI() {
 
   renderReturnSummary();
 
-  if (state.day !== lastTimelineDay) {
+  if (!historyMode && state.day !== lastTimelineDay) {
     lastTimelineDay = state.day;
     fetchTimeline();
   }
@@ -849,6 +1142,7 @@ function updateUI() {
 
   // 选择变了就告诉节点；同一个目标不重复发，心跳由上面的定时器负责。
   syncPresence();
+  scheduleTranslate();
 }
 
 // ---------- 交互 ----------
@@ -939,6 +1233,56 @@ whisperForm.addEventListener('submit', async (e) => {
   }
 });
 
+// 浅睡 / 举报按钮在每次重绘的 agentInfo 里，用事件委托。
+agentInfoEl.addEventListener('click', async (event) => {
+  const reportBtn = event.target.closest('[data-report]');
+  if (reportBtn) {
+    const reason = window.prompt('举报这个居民？可以写一句原因（只保存在本机）。', '');
+    if (reason === null) return;
+    reportBtn.disabled = true;
+    try {
+      const res = await fetch('/api/report', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          agentId: reportBtn.dataset.report,
+          reason,
+          viewerId: VIEWER_ID,
+        }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      whisperNote.textContent = `已经记在本机（${data.count} 次）。${data.note || ''}`;
+    } catch (err) {
+      whisperNote.textContent = `举报失败：${String(err?.message || err)}`;
+    } finally {
+      reportBtn.disabled = false;
+    }
+    return;
+  }
+
+  const btn = event.target.closest('[data-shallow]');
+  if (!btn) return;
+  const original = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '正在安排…';
+  try {
+    const res = await fetch('/api/shallow', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: btn.dataset.shallow }),
+    });
+    const data = await res.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+    whisperNote.textContent = data.note || '浅睡已经安排好。';
+  } catch (err) {
+    whisperNote.textContent = `浅睡失败：${String(err?.message || err)}`;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = original;
+  }
+});
+
 configForm.addEventListener('submit', async (e) => {
   e.preventDefault();
   const fd = new FormData(configForm);
@@ -968,12 +1312,44 @@ narrateBtn.addEventListener('click', () => {
 
 todayBtn.addEventListener('click', () => {
   selectedDay = null;
+  exitHistory();
   renderTimeline();
   loadChronicle(currentDay(), currentDay(), { force: true });
 });
 
+exportBtn.addEventListener('click', async () => {
+  const day = selectedDay || currentDay();
+  exportBtn.disabled = true;
+  exportBtn.textContent = '导出中…';
+  try {
+    const response = await fetch('/api/chronicle/export', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ viewerId: VIEWER_ID, fromDay: day, toDay: day }),
+    });
+    const data = await response.json();
+    if (!data.ok) throw new Error(data.error || `HTTP ${response.status}`);
+    const blob = new Blob([data.markdown], { type: 'text/markdown;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = data.filename || `island-chronicle-d${day}.md`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    URL.revokeObjectURL(url);
+  } catch (err) {
+    chronicleBody.textContent = `导出失败：${String(err?.message || err)}`;
+  } finally {
+    exportBtn.disabled = false;
+    exportBtn.textContent = '导出这一版';
+  }
+});
+
 let bootstrapped = false;
 function acceptState(next) {
+  liveState = next;
+  if (historyMode) return;
   state = next;
   render();
   updateUI();
@@ -982,6 +1358,140 @@ function acceptState(next) {
     fetchTimeline();
     loadChronicle(currentDay(), currentDay());
   }
+}
+
+// ---------- 上传（arrival） ----------
+// 一次性成本在浏览器里算，字段和 nonce 的规范化必须和服务器的 stableStringify 一致。
+const ARRIVAL_VERSION_CLIENT = 'island-arrival/1';
+let arrivalConfig = null;
+
+function stableStringify(value) {
+  if (value === undefined) return 'null';
+  if (value === null || typeof value !== 'object') return JSON.stringify(value);
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`;
+  const keys = Object.keys(value).filter((k) => value[k] !== undefined).sort();
+  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(value[k])}`).join(',')}}`;
+}
+
+async function sha256Hex(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+async function mineArrivalPoW(core, difficulty) {
+  const prefix = '0'.repeat(Math.max(0, Math.min(8, Number(difficulty) || 0)));
+  for (let nonce = 0; nonce < 5_000_000; nonce++) {
+    const hash = await sha256Hex(stableStringify({ version: ARRIVAL_VERSION_CLIENT, core, nonce }));
+    if (hash.startsWith(prefix)) return { nonce, difficulty: prefix.length };
+    if (nonce > 0 && nonce % 2500 === 0) {
+      arrivalNote.textContent = `正在计算一次性成本…（${nonce}）`;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+  }
+  throw new Error('一次性成本计算超时');
+}
+
+function fillArrivalSelect(select, keys, labels) {
+  select.innerHTML = '';
+  for (const key of keys || []) {
+    const option = document.createElement('option');
+    option.value = key;
+    option.textContent = labels?.[key] || key;
+    select.appendChild(option);
+  }
+}
+
+async function openArrival() {
+  arrivalNote.textContent = '';
+  try {
+    const response = await fetch('/api/arrival');
+    arrivalConfig = await response.json();
+  } catch {
+    arrivalNote.textContent = '没有连上世界。';
+    arrivalDialog.showModal();
+    return;
+  }
+  if (!arrivalConfig?.ok) {
+    arrivalNote.textContent = '这个节点暂时不能接收上传。';
+    arrivalDialog.showModal();
+    return;
+  }
+  fillArrivalSelect(arrivalForm.origin, arrivalConfig.origins);
+  fillArrivalSelect(arrivalForm.aptitude, arrivalConfig.aptitudes);
+  fillArrivalSelect(arrivalForm.language, arrivalConfig.languages, state?.labels?.languages);
+  arrivalNotice.textContent = arrivalConfig.notice;
+  arrivalSubmit.disabled = !!arrivalConfig.hasUploaded;
+  if (arrivalConfig.hasUploaded) {
+    arrivalNote.textContent = '这个节点已经上传过一个人了。每个人只能上传一次。';
+  }
+  arrivalDialog.showModal();
+}
+
+arrivalBtn.addEventListener('click', openArrival);
+arrivalClose.addEventListener('click', () => arrivalDialog.close());
+
+arrivalForm.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  if (!arrivalConfig?.ok) return;
+  const core = {
+    name: arrivalForm.name.value.trim(),
+    origin: arrivalForm.origin.value,
+    aptitude: arrivalForm.aptitude.value,
+    language: arrivalForm.language.value,
+    obsession: arrivalForm.obsession.value.trim(),
+    wound: arrivalForm.wound.value.trim(),
+    voice: arrivalForm.voice.value.trim(),
+  };
+
+  arrivalSubmit.disabled = true;
+  arrivalNote.textContent = `正在计算一次性成本（前 ${arrivalConfig.difficulty} 个零）…`;
+  try {
+    const pow = await mineArrivalPoW(core, arrivalConfig.difficulty);
+    arrivalNote.textContent = '正在交给当前写入节点…';
+    const response = await fetch('/api/arrival', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ core, pow, playerId: VIEWER_ID }),
+    });
+    const data = await response.json();
+    if (!data.ok) {
+      arrivalNote.textContent = data.error || `上传失败（HTTP ${response.status}）`;
+      return;
+    }
+    arrivalNote.textContent = `${data.name} 从雾里走上了岛。`;
+    arrivalConfig.hasUploaded = true;
+    if (data.agentId) {
+      selectedId = data.agentId;
+      mode = 'follow';
+      updateUI();
+    }
+    setTimeout(() => arrivalDialog.close(), 1400);
+  } catch (err) {
+    arrivalNote.textContent = String(err?.message || err);
+  } finally {
+    arrivalSubmit.disabled = !!arrivalConfig?.hasUploaded;
+  }
+});
+
+if (langBtn) {
+  langBtn.textContent = LANG === 'en' ? '中' : 'EN';
+  langBtn.addEventListener('click', () => {
+    const next = LANG === 'en' ? 'zh' : 'en';
+    localStorage.setItem('island-lang', next);
+    const url = new URL(location.href);
+    url.searchParams.set('lang', next);
+    location.href = url.toString();
+  });
+}
+
+if (PUBLIC_MODE) {
+  const controls = document.querySelector('.controls');
+  if (controls) controls.hidden = true;
+  const brainPanel = document.getElementById('brainPanel');
+  if (brainPanel) brainPanel.hidden = true;
+  whisperForm.hidden = true;
+  const subtitle = document.querySelector('.brand p');
+  if (subtitle) subtitle.textContent = '看台 · 只读 · 每个人的版本都不一样';
 }
 
 refreshSyncStatus();

@@ -2,4 +2,6 @@ world-save*.json
 world-save*.json.tmp
 node-key*.json
 trusted-peers*.json
+reports-*.json
+narratives-*.json
 node_modules/

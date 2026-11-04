@@ -455,7 +455,7 @@ function describePerception(world, a) {
 function buildPrompt(world, a) {
   const near = describePerception(world, a);
   const sys = `你叫${a.name}。你已经死了，在一片废墟中的岛上醒来。人类已经停止繁衍，你是最后一批被上传的人之一。没有人解释这里是哪里，世界不解释任何东西。
-你的一生：出身${a.tags.origin}；你放不下的执念是「${a.tags.obsession}」；你的禀赋是${a.tags.aptitude}；你有一道旧伤：${a.tags.wound}。
+你的一生：出身${a.tags.origin}；你放不下的执念是「${a.tags.obsession}」；你的禀赋是${a.tags.aptitude}；你有一道旧伤：${a.tags.wound}。${a.voice ? `你说话的口吻是「${a.voice}」。` : ''}
 你只能输出一个 JSON，不要解释，不要 Markdown，不要代码块。`;
 
   const canWalk = ['N', 'S', 'E', 'W'].filter((d) => {
@@ -720,6 +720,69 @@ async function llmTurning(world, a, proposal) {
   }
 }
 
+// ---------- 主人节点的提案 ----------
+// 上传者所在的节点可以替自己的居民算好下一步，签名后交给当前权威。
+// 权威只把它当成一个“已经想好的动作”，仍然走引擎的判定；
+// 如果这一拍没收到，就照常退回规则/本机模型。
+
+const ownerIntents = new Map(); // agentId -> { action, from, at, basedOnTick }
+const OWNER_INTENT_TTL_MS = 8000;
+const OWNER_INTENT_STALE_TICKS = 40;
+
+export function queueOwnerIntent(agentId, intent) {
+  if (!agentId || !intent?.action) return false;
+  ownerIntents.set(agentId, {
+    action: intent.action,
+    from: intent.from || null,
+    at: Date.now(),
+    basedOnTick: Number(intent.basedOnTick) || 0,
+  });
+  return true;
+}
+
+export function takeOwnerIntent(agentId, world) {
+  const entry = ownerIntents.get(agentId);
+  if (!entry) return null;
+  ownerIntents.delete(agentId);
+  if (Date.now() - entry.at > OWNER_INTENT_TTL_MS) return null;
+  if (entry.basedOnTick && world.tick - entry.basedOnTick > OWNER_INTENT_STALE_TICKS) return null;
+  if (entry.basedOnTick && entry.basedOnTick > world.tick + 60) return null;
+  return entry;
+}
+
+export function resetOwnerState() {
+  ownerIntents.clear();
+}
+
+/**
+ * 供上传者节点调用：优先用主人配置的模型，没有模型就用规则。
+ * mockDecide 会消耗世界 RNG；这里保存并恢复，避免在权威节点上
+ * 把“提议”变成一次没有写进日志的随机数消耗。
+ */
+export async function decideForOwner(world, a) {
+  if (world.api?.key) {
+    try {
+      const action = await llmDecide(world, a);
+      if (action) return action;
+    } catch (err) {
+      world.llmErrors = (world.llmErrors || 0) + 1;
+      world.llmLastError = String(err?.message || err);
+    }
+  }
+  const state = world.rng.getState();
+  try {
+    return mockDecide(world, a);
+  } finally {
+    world.rng.setState(state);
+  }
+}
+
+// 外部节点交来的动作要重新过一遍受控解析，防止任意 JSON 直接进引擎。
+export function sanitizeAction(world, a, obj) {
+  if (!obj || typeof obj !== 'object') return null;
+  return normalize(world, a, JSON.stringify(obj));
+}
+
 // ---------- 调度 ----------
 
 function recordDecision(world, a, action, source) {
@@ -803,6 +866,33 @@ export function processBrains(world) {
   for (const a of queue) {
     if (!a.alive) {
       a.deciding = false;
+      continue;
+    }
+
+    // 主人节点已经替这个人想好了下一步：直接用，并把它写进决策日志。
+    const ownerIntent = takeOwnerIntent(a.id, world);
+    if (ownerIntent) {
+      a.queuedAction = ownerIntent.action;
+      recordDecision(world, a, ownerIntent.action, 'owner');
+      a.deciding = false;
+      a.cooldownUntil = Math.max(a.cooldownUntil || 0, world.tick + 2);
+      continue;
+    }
+
+    // 主人还在线（清醒租约来自 owner-online），但这一拍还没提案：
+    // 让这个人发一会儿呆，而不是被规则接手。等待本身也写进决策日志，
+    // 这样重放时每个节点都会做出同样的等待。
+    if (
+      a.arrivedBy &&
+      a.presence === 'online' &&
+      a.presenceReason === 'owner-online' &&
+      (a.presenceUntil || 0) > world.tick
+    ) {
+      const wait = { type: 'idle', remaining: 6, reason: '等主人的下一步' };
+      a.queuedAction = wait;
+      recordDecision(world, a, wait, 'owner-wait');
+      a.deciding = false;
+      a.cooldownUntil = Math.max(a.cooldownUntil || 0, world.tick + 2);
       continue;
     }
 

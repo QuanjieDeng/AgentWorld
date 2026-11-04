@@ -63,6 +63,15 @@ export function verifyText(publicKeyPem, text, signature) {
   }
 }
 
+// 通用：签一个可规范化（stableStringify）的对象，不绑定具体用途。
+export function signPayload(identity, payload) {
+  return signText(identity, stableStringify(payload));
+}
+
+export function verifyPayload(publicKeyPem, payload, signature) {
+  return verifyText(publicKeyPem, stableStringify(payload), signature);
+}
+
 // ---------- 节点身份 ----------
 
 export function generateNodeIdentity(nodeId) {

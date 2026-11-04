@@ -22,6 +22,7 @@
           <span id="clock">第 1 天 · 08:00</span>
           <span id="pop">活着 12 / 12</span>
           <span id="syncStatus" class="sync-status" title="同步状态">单机</span>
+          <button id="langBtn" class="lang-btn" title="切换语言">EN</button>
         </div>
         <div class="controls">
           <button id="pauseBtn">暂停</button>
@@ -29,6 +30,7 @@
           <button class="speed" data-speed="2">2×</button>
           <button class="speed" data-speed="4">4×</button>
           <button class="speed" data-speed="8">8×</button>
+          <button id="arrivalBtn">上传一个人</button>
         </div>
       </header>
 
@@ -77,6 +79,7 @@
           <span class="chron-actions">
             <button id="todayBtn">今天</button>
             <button id="narrateBtn">生成</button>
+            <button id="exportBtn">导出这一版</button>
           </span>
         </div>
         <div id="chronicleRange" class="muted">第 1 天</div>
@@ -108,6 +111,25 @@
       </section>
     </aside>
   </div>
+
+  <dialog id="arrivalDialog">
+    <form id="arrivalForm" autocomplete="off">
+      <div class="return-head">
+        <h2>从雾里走上岛</h2>
+        <button type="button" id="arrivalClose">关闭</button>
+      </div>
+      <p class="note" id="arrivalNotice">日志只追加、不可删除。请不要写任何可以辨认真实他人的信息。</p>
+      <label>名字 <input name="name" maxlength="8" required placeholder="1–8 个字" /></label>
+      <label>出身 <select name="origin" required></select></label>
+      <label>禀赋 <select name="aptitude" required></select></label>
+      <label>语言 <select name="language" required></select></label>
+      <label>执念 <input name="obsession" maxlength="30" required placeholder="放不下的那件事" /></label>
+      <label>旧伤 <input name="wound" maxlength="40" required placeholder="一道旧伤" /></label>
+      <label>一句口吻 <input name="voice" maxlength="40" required placeholder="他说话像……" /></label>
+      <button type="submit" id="arrivalSubmit">上传</button>
+      <div class="note" id="arrivalNote"></div>
+    </form>
+  </dialog>
 
   <script src="/app.js"></script>
 </body>
