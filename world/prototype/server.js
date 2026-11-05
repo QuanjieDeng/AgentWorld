@@ -58,6 +58,7 @@ import {
   keyIdFromPublicKey,
   loadOrCreateIdentity,
   normalizePublicKey,
+  sha256Hex,
   requestSigningText,
   signEnvelope,
   signIdentityDocument,
@@ -124,6 +125,9 @@ const OWNER_INTENT_INTERVAL_MS = Math.max(500, Number(process.env.OWNER_INTENT_I
 const OWNER_LEASE_TICKS = Math.max(10, Number(process.env.OWNER_LEASE_TICKS) || 60);
 // 浅睡：付一次“保管费”换一个世界日的半离线保护（v1 只实现机制，未接支付）。
 const SHALLOW_LEASE_TICKS = Math.max(8, Number(process.env.SHALLOW_LEASE_TICKS) || TICKS_PER_DAY);
+// 保管凭证的占位实现：真实产品里由支付/保管服务签发，v1 只认一个共享 token。
+const CUSTODY_TOKEN = String(process.env.CUSTODY_TOKEN || '');
+const CUSTODY_MAX_DAYS = 365;
 // 离线推进上限：默认最多补 7 个世界日，超出部分只报告 skippedTicks。
 const OFFLINE_MAX_DAYS = Math.max(0, Number(process.env.OFFLINE_MAX_DAYS) || 7);
 // 举报只保存在本机，供人工查看；不进世界日志（避免把举报内容写进不可删除的共享历史）。
@@ -270,8 +274,11 @@ function loadOrCreate() {
   }
 }
 
+const BELIEF_RULES = process.env.BELIEF_RULES === '1';
 let world = loadOrCreate();
 world.config.speed = SPEED;
+// 实验开关：规则大脑改用“自己的信念”判断威胁，而不是全知的世界状态。
+world.config.beliefDrivenRules = BELIEF_RULES;
 // 本进程启动时的日志头。之后新写的事件如果在分区愈合时被静默丢弃，
 // 说明它们已经给观看者看过——这种情况必须人工确认，不能自动采纳。
 const STARTUP_SEQ = world.nextSeq - 1;
@@ -401,7 +408,8 @@ function reconcilePresence(now = Date.now()) {
     } else if (
       agent.presence === 'online' &&
       agent.presenceReason !== 'owner-online' &&
-      agent.presenceReason !== 'shallow'
+      agent.presenceReason !== 'shallow' &&
+      agent.presenceReason !== 'custody'
     ) {
       // 主人提案和浅睡都有自己的租约，守望的心跳不能把它们关掉。
       const event = setPresence(world, agent, { online: false, reason: 'no-tender' });
@@ -451,6 +459,13 @@ function tokenOk(req) {
   if (!SYNC_TOKEN) return false;
   const supplied = Buffer.from(String(req.headers.authorization || '').replace(/^Bearer\s+/i, ''));
   const expected = Buffer.from(SYNC_TOKEN);
+  return supplied.length === expected.length && timingSafeEqual(supplied, expected);
+}
+
+function custodyTokenOk(token) {
+  if (!CUSTODY_TOKEN) return false;
+  const supplied = Buffer.from(String(token || ''));
+  const expected = Buffer.from(CUSTODY_TOKEN);
   return supplied.length === expected.length && timingSafeEqual(supplied, expected);
 }
 
@@ -624,6 +639,57 @@ ${lines.join('\n') || '（这段时间没有关键事件）'}
   const text = await requestLLM(world, sys, user, 700);
   if (!String(text || '').trim()) throw new Error('LLM 返回了空叙事');
   return text;
+}
+
+// 英文世界文本的按需翻译：只翻译请求里出现的片段，结果缓存在本机。
+// 没配置模型时原样返回中文——界面外壳仍然是英文的。
+const translationCache = new Map();
+
+function translationKey(text) {
+  return sha256Hex(`en|${text}`);
+}
+
+async function translateTexts(texts) {
+  const list = texts.map((t) => String(t || ''));
+  if (!world.api.key || !list.length) return { translations: list, model: false };
+
+  const missing = [...new Set(list.filter((t) => t && !translationCache.has(translationKey(t))))];
+  if (missing.length) {
+    const sys =
+      'You are a translator. Translate each Chinese line into concise, natural English. ' +
+      'Keep names as they appear. Do not add explanations. Output only a JSON array of strings, ' +
+      'same length and order as the input.';
+    const user = JSON.stringify(missing);
+    const raw = await requestLLM(world, sys, user, 1200);
+    const match = String(raw || '').match(/\[[\s\S]*\]/);
+    if (match) {
+      const parsed = JSON.parse(match[0]);
+      if (Array.isArray(parsed) && parsed.length === missing.length) {
+        for (let i = 0; i < missing.length; i++) {
+          const value = String(parsed[i] ?? '').trim();
+          if (value) translationCache.set(translationKey(missing[i]), value);
+        }
+      }
+    }
+    while (translationCache.size > 2000) {
+      translationCache.delete(translationCache.keys().next().value);
+    }
+  }
+
+  return {
+    translations: list.map((t) => (t ? translationCache.get(translationKey(t)) || t : t)),
+    model: true,
+  };
+}
+
+async function translateNarrative(result, lang) {
+  if (lang !== 'en' || !result?.narrative) return result;
+  try {
+    const { translations } = await translateTexts([result.narrative]);
+    return { ...result, narrative: translations[0] || result.narrative, translated: true };
+  } catch {
+    return result;
+  }
 }
 
 async function handleApi(req, res, url) {
@@ -943,6 +1009,127 @@ async function handleApi(req, res, url) {
       presenceUntil: agent.presenceUntil,
       leaseTicks: SHALLOW_LEASE_TICKS,
       note: 'v1 只实现浅睡机制，支付是外部闸门',
+    });
+  }
+
+  // 保管凭证（占位）：用外部签发的 token 给自己的居民买长期在线保护。
+  // 真实产品应换成支付服务签名的收据；v1 只认一个共享 token。
+  if (url.pathname === '/api/custody' && req.method === 'POST') {
+    if (!CUSTODY_TOKEN) {
+      return json(res, { ok: false, error: 'custody vouchers are not configured' }, 503);
+    }
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    const agent = world.agents.find(
+      (a) => a.id === String(body.agentId || '') && a.alive && !a.faded
+    );
+    if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+    if (agent.arrivedBy !== NODE_ID) {
+      return json(res, { ok: false, error: 'only the owner node can redeem custody' }, 403);
+    }
+    if (!custodyTokenOk(body.token)) {
+      return json(res, { ok: false, error: 'invalid custody voucher' }, 401);
+    }
+    const days = Math.max(
+      1,
+      Math.min(CUSTODY_MAX_DAYS, Math.floor(Number(body.days) || CUSTODY_MAX_DAYS))
+    );
+
+    if (canWriteLocally()) {
+      setPresence(world, agent, {
+        online: true,
+        untilTick: world.tick + days * TICKS_PER_DAY,
+        by: NODE_ID,
+        reason: 'custody',
+      });
+      saveWorld();
+      broadcast();
+      return json(res, {
+        ok: true,
+        agentId: agent.id,
+        presence: agent.presence,
+        presenceReason: agent.presenceReason,
+        presenceUntil: agent.presenceUntil,
+        days,
+        note: 'v1 凭证占位，真实支付未接',
+      });
+    }
+
+    if (PEER) {
+      const authorityId = authorityFor();
+      const target = [...peerHealth.entries()].find(([, health]) => health.nodeId === authorityId)?.[0];
+      if (target) {
+        try {
+          const payload = { agentId: agent.id, days };
+          const headers = {
+            'Content-Type': 'application/json',
+            ...signRequest(identity, {
+              method: 'POST',
+              path: '/api/custody/publish',
+              body: payload,
+            }),
+          };
+          const response = await fetch(`${target}/api/custody/publish`, {
+            method: 'POST',
+            headers,
+            body: JSON.stringify(payload),
+            signal: AbortSignal.timeout(8000),
+          });
+          const out = await response.json();
+          return json(res, out, response.status);
+        } catch (err) {
+          return json(res, { ok: false, error: String(err?.message || err) }, 502);
+        }
+      }
+    }
+    return json(
+      res,
+      { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+      409
+    );
+  }
+
+  if (url.pathname === '/api/custody/publish' && req.method === 'POST') {
+    if (MIRROR) return json(res, { ok: false, error: 'this node is read-only' }, 403);
+    if (!SYNC_TOKEN && !VERIFY_SIGNATURES) {
+      return json(res, { ok: false, error: 'SYNC_TOKEN is required' }, 503);
+    }
+    const auth = authPeerRequest(req, body);
+    if (!auth.ok) return json(res, { ok: false, error: auth.error }, auth.status);
+    if (!canWriteLocally()) {
+      return json(
+        res,
+        { ok: false, error: 'this node is not the log authority', authorityId: authorityFor() },
+        409
+      );
+    }
+    const agent = world.agents.find(
+      (a) => a.id === String(body.agentId || '') && a.alive && !a.faded
+    );
+    if (!agent) return json(res, { ok: false, error: 'no such resident' }, 404);
+    if (agent.arrivedBy !== auth.nodeId) {
+      return json(res, { ok: false, error: 'not your resident' }, 403);
+    }
+    const days = Math.max(
+      1,
+      Math.min(CUSTODY_MAX_DAYS, Math.floor(Number(body.days) || CUSTODY_MAX_DAYS))
+    );
+    setPresence(world, agent, {
+      online: true,
+      untilTick: world.tick + days * TICKS_PER_DAY,
+      by: auth.nodeId,
+      reason: 'custody',
+    });
+    saveWorld();
+    broadcast();
+    return json(res, {
+      ok: true,
+      forwarded: true,
+      agentId: agent.id,
+      presence: agent.presence,
+      presenceReason: agent.presenceReason,
+      presenceUntil: agent.presenceUntil,
+      days,
+      note: 'v1 凭证占位，真实支付未接',
     });
   }
 
@@ -1301,6 +1488,25 @@ async function handleApi(req, res, url) {
     }
   }
 
+  // 按需翻译：英文界面用。没有模型时原样返回中文。
+  if (url.pathname === '/api/translate' && req.method === 'POST') {
+    const texts = Array.isArray(body.texts)
+      ? body.texts.slice(0, 30).map((t) => String(t || '').slice(0, 1200))
+      : [];
+    if (!texts.length) return json(res, { ok: true, translations: [], model: false });
+    try {
+      const result = await translateTexts(texts);
+      return json(res, { ok: true, ...result });
+    } catch (err) {
+      return json(res, {
+        ok: true,
+        translations: texts,
+        model: false,
+        error: String(err?.message || err),
+      });
+    }
+  }
+
   // 导出「我的版本」的编年史。每个观看者的叙事不同，所以导出的是本机这份。
   if (url.pathname === '/api/chronicle/export') {
     const viewerId = String(body.viewerId || '').slice(0, 64) || null;
@@ -1324,6 +1530,7 @@ async function handleApi(req, res, url) {
     }
     trimNarratives();
     saveNarratives();
+    result = await translateNarrative(result, body.lang);
     const markdown = [
       '# 最后的岛 · 编年史（我的版本）',
       '',
@@ -1352,28 +1559,33 @@ async function handleApi(req, res, url) {
     const range = { fromDay, toDay };
 
     if (!world.api.key) {
-      const result = await narrate(world, viewerId, range, defaultNarrator, {
-        store: narrativeStore,
-      });
+      const result = await translateNarrative(
+        await narrate(world, viewerId, range, defaultNarrator, { store: narrativeStore }),
+        body.lang
+      );
       trimNarratives();
       saveNarratives();
       return json(res, { ok: true, ...result, model: false, fallback: false });
     }
 
     try {
-      const result = await narrate(world, viewerId, range, llmNarrator, {
-        store: narrativeStore,
-      });
+      const result = await translateNarrative(
+        await narrate(world, viewerId, range, llmNarrator, { store: narrativeStore }),
+        body.lang
+      );
       trimNarratives();
       saveNarratives();
       return json(res, { ok: true, ...result, model: true, fallback: false });
     } catch (err) {
       world.llmErrors = (world.llmErrors || 0) + 1;
       world.llmLastError = String(err?.message || err);
-      const result = await narrate(world, viewerId, range, defaultNarrator, {
-        cache: false,
-        store: narrativeStore,
-      });
+      const result = await translateNarrative(
+        await narrate(world, viewerId, range, defaultNarrator, {
+          cache: false,
+          store: narrativeStore,
+        }),
+        body.lang
+      );
       trimNarratives();
       saveNarratives();
       return json(res, { ok: true, ...result, model: true, fallback: true });
@@ -1771,7 +1983,7 @@ async function submitOwnerIntents() {
       // 浅睡期间不要自动发提案，否则会把浅睡立刻续成主人上线。
       if (
         agent.presence === 'online' &&
-        agent.presenceReason === 'shallow' &&
+        (agent.presenceReason === 'shallow' || agent.presenceReason === 'custody') &&
         (agent.presenceUntil || 0) > world.tick
       ) {
         continue;
@@ -1892,6 +2104,7 @@ server.listen(PORT, () => {
   console.log(
     `  身份：${identity.keyId} · 签名${VERIFY_SIGNATURES ? '校验开启' : '校验关闭'} · 信任 ${trust.size()} 个节点`
   );
+  if (BELIEF_RULES) console.log('  规则大脑：按自己的信念判断威胁（实验开关）');
   if (PEER) {
     console.log(
       `  peer 模式 · 节点 ${NODES.join(', ')} · 每 ${TERM_EVENTS} 条事件轮换 · 当前第 ${currentTerm()} 任：${authorityFor()}`

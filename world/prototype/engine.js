@@ -295,6 +295,7 @@ export function createWorld(seed = 20261102) {
       llmAgents: 0,
       distortionChance: DEFAULT_DISTORTION,
       remembranceDecay: DEFAULT_REMEMBRANCE_DECAY,
+      beliefDrivenRules: false,
     },
     api: { provider: 'openai', base: '', key: '', model: '' },
     inflight: 0,
@@ -527,6 +528,7 @@ function makeArrivalAgent(world, id, core, x, y, creator) {
     voice: core.voice,
     arrivedAtTick: world.tick,
     arrivedBy: creator?.nodeId || null,
+    arrivedKeyId: creator?.keyId || null,
   };
 }
 
@@ -847,6 +849,9 @@ export const TURNING_TRIGGERS = {
   betrayed: { labels: ['独行者', '不再相信人的人'] },
   leader: { labels: ['首领', '被追随的人'] },
   hunted: { labels: ['猎手', '不怕夜的人'] },
+  // 临终补足“一生 2–5 次”的下限；标签由 id 确定性选择，不消耗 RNG。
+  last_days: { labels: ['把话说完的人', '回望的人', '最后的人'] },
+  deathbed: { labels: ['留下名字的人', '走到尽头的人'] },
 };
 
 function nameOf(world, id) {
@@ -1078,8 +1083,34 @@ function nearFire(world, x, y, r = 2) {
   return world.structures.some((s) => s.type === 'fire' && Math.abs(s.x - x) + Math.abs(s.y - y) <= r);
 }
 
+function deterministicTurningLabel(agent, trigger) {
+  const labels = TURNING_TRIGGERS[trigger]?.labels || ['幸存者'];
+  const n = Number(String(agent.id).replace(/\D/g, '')) || 0;
+  return labels[n % labels.length];
+}
+
+// “一生 2–5 次”的下限：死前还没到 2 次的人，在最后一刻完成临终脱变。
+// 标签只由 id 决定，不消耗 RNG；重放时同一个 kill 会做出同样的选择。
+function ensureFinalTurnings(world, agent, cause) {
+  if (!agent || agent.turningPoints.length >= 2) return;
+  const triggers = agent.turningPoints.length === 0 ? ['last_days', 'deathbed'] : ['deathbed'];
+  for (const trigger of triggers) {
+    if (agent.turningPoints.length >= 2) break;
+    if (agent.turningPoints.length >= agent.maxTurnings) break;
+    if (agent.turningPoints.some((t) => t.trigger === trigger)) continue;
+    applyTurning(
+      world,
+      agent,
+      trigger,
+      deterministicTurningLabel(agent, trigger),
+      `你走到了尽头。${cause}`
+    );
+  }
+}
+
 export function kill(world, a, cause, killerId = null) {
   if (!a.alive) return;
+  ensureFinalTurnings(world, a, cause);
   a.alive = false;
   a.hp = 0;
   a.action = null;
@@ -2556,6 +2587,7 @@ export function serializeWorld(world) {
       speed: world.config.speed,
       distortionChance: world.config.distortionChance ?? DEFAULT_DISTORTION,
       remembranceDecay: world.config.remembranceDecay ?? DEFAULT_REMEMBRANCE_DECAY,
+      beliefDrivenRules: !!world.config.beliefDrivenRules,
     },
     api: {},
     rngState: world.rng.getState(),
@@ -2606,6 +2638,7 @@ export function loadWorld(data) {
       llmAgents: 0,
       distortionChance: DEFAULT_DISTORTION,
       remembranceDecay: DEFAULT_REMEMBRANCE_DECAY,
+      beliefDrivenRules: false,
       ...data.config,
     },
     api: { provider: 'openai', base: '', key: '', model: '' },
@@ -2678,6 +2711,7 @@ export function snapshot(world) {
       languages: { ...a.languages },
       voice: a.voice || '',
       arrivedBy: a.arrivedBy || null,
+      arrivedKeyId: a.arrivedKeyId || null,
       arrivedAtTick: a.arrivedAtTick ?? null,
       presence: a.presence,
       presenceReason: a.presenceReason || null,

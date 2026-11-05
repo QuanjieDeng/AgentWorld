@@ -165,6 +165,7 @@ function launch({ port, dir }) {
       PRESENCE_LEASE_TICKS: '20',
       ARRIVAL_DIFFICULTY: '2',
       SHALLOW_LEASE_TICKS: '8',
+      CUSTODY_TOKEN: 'test-custody',
       // 测试不启动自动提案，否则主人循环会在浅睡结束后立刻把租约续成 owner-online。
       OWNER_INTENT_INTERVAL_MS: '60000',
     },
@@ -449,6 +450,36 @@ test('主人可以给自己的居民买浅睡，租约到期后睡回去', async
       { timeoutMs: 12_000, detail: dump }
     );
     assert.equal(asleep.agents.find((a) => a.id === agentId).presenceReason, null);
+
+    // 保管凭证占位：错误 token 拒绝，正确 token 换成长期在线保护。
+    const wrong = await fetch(`${base}/api/custody`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId, token: 'wrong-token' }),
+    });
+    assert.equal(wrong.status, 401);
+
+    const custody = await fetch(`${base}/api/custody`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId, token: 'test-custody', days: 30 }),
+    });
+    const custodyBody = await custody.json();
+    assert.equal(custody.status, 200, JSON.stringify(custodyBody));
+    assert.equal(custodyBody.presenceReason, 'custody');
+    assert.ok(custodyBody.presenceUntil > 0);
+    const afterCustody = await getState(port);
+    assert.equal(
+      afterCustody.agents.find((a) => a.id === agentId).presenceReason,
+      'custody'
+    );
+
+    const deniedCustody = await fetch(`${base}/api/custody`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ agentId: other.id, token: 'test-custody' }),
+    });
+    assert.equal(deniedCustody.status, 403);
   } catch (err) {
     err.message += `\n${dump()}`;
     throw err;

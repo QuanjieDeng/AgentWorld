@@ -358,6 +358,7 @@ function presenceLabel(a) {
     return a.action === 'idle' ? '主人在线 · 等提案' : '主人的模型';
   }
   if (a.presenceReason === 'shallow') return '浅睡 · 不会淡出';
+  if (a.presenceReason === 'custody') return '保管中 · 不会淡出';
   return '有人守着';
 }
 
@@ -677,7 +678,9 @@ function renderAgentPanel() {
               ? '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">主人在线</span>'
               : a.presenceReason === 'shallow'
                 ? '<span class="badge" style="color:#c9b26a;border-color:#5a503a">浅睡</span>'
-                : '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">醒着 · 有人守着</span>'
+                : a.presenceReason === 'custody'
+                  ? '<span class="badge" style="color:#c9b26a;border-color:#5a503a">保管中</span>'
+                  : '<span class="badge" style="color:#9fd39a;border-color:#3f5a3a">醒着 · 有人守着</span>'
             : '<span class="badge" style="color:#b9b2a0;border-color:#4a4a44">睡着 · 本能</span>'
           : ''
       }
@@ -686,7 +689,7 @@ function renderAgentPanel() {
     </div>
     ${renderLineage(a)}
     ${a.inheritedFrom ? `<div class="lineage">继承自 <span class="me">${escapeHtml(a.inheritedFrom)}</span></div>` : ''}
-    ${a.arrivedBy ? `<div class="lineage">从雾里走上岛 · 上传自 <span class="me">${escapeHtml(a.arrivedBy)}</span></div>` : ''}
+    ${a.arrivedBy ? `<div class="lineage">从雾里走上岛 · 上传自 <span class="me">${escapeHtml(a.arrivedBy)}</span>${a.arrivedKeyId ? ` · 钥匙 ${escapeHtml(a.arrivedKeyId)}` : ''}</div>` : ''}
     <div class="tags">
       <b>出身</b> ${escapeHtml(a.tags.origin)} · <b>家乡</b> ${escapeHtml(a.tags.hometown || '')}<br>
       <b>执念</b> ${escapeHtml(a.tags.obsession)}<br>
@@ -712,13 +715,20 @@ function renderAgentPanel() {
                   : ' · 主人的模型在驱动'
                 : a.presenceReason === 'shallow'
                   ? ' · 浅睡中，不会淡出'
-                  : ' · 有人守着，不会淡出'
+                  : a.presenceReason === 'custody'
+                    ? ' · 保管中，不会淡出'
+                    : ' · 有人守着，不会淡出'
               : ' · 没人看着，按本能活着'
           }`
     }</div>
     ${
       !PUBLIC_MODE && !historyMode && a.arrivedBy && a.alive
         ? `<button type="button" class="shallow-btn" data-shallow="${escapeHtml(a.id)}">浅睡一天（自费）</button>`
+        : ''
+    }
+    ${
+      !PUBLIC_MODE && !historyMode && a.arrivedBy && a.alive
+        ? `<button type="button" class="shallow-btn" data-custody="${escapeHtml(a.id)}">保管（凭证）</button>`
         : ''
     }
     ${
@@ -1014,7 +1024,7 @@ async function loadChronicle(fromDay, toDay, { force = false } = {}) {
     const res = await fetch('/api/chronicle', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ viewerId: VIEWER_ID, fromDay, toDay }),
+      body: JSON.stringify({ viewerId: VIEWER_ID, fromDay, toDay, lang: LANG }),
     });
     const data = await res.json();
     if (token !== chronicleToken) return;
@@ -1235,6 +1245,31 @@ whisperForm.addEventListener('submit', async (e) => {
 
 // 浅睡 / 举报按钮在每次重绘的 agentInfo 里，用事件委托。
 agentInfoEl.addEventListener('click', async (event) => {
+  const custodyBtn = event.target.closest('[data-custody]');
+  if (custodyBtn) {
+    const token = window.prompt('输入保管凭证：', '');
+    if (!token) return;
+    const daysRaw = window.prompt('保管多少天？', '365');
+    if (daysRaw === null) return;
+    const days = Math.max(1, Math.min(365, Number(daysRaw) || 365));
+    custodyBtn.disabled = true;
+    try {
+      const res = await fetch('/api/custody', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ agentId: custodyBtn.dataset.custody, token, days }),
+      });
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || `HTTP ${res.status}`);
+      whisperNote.textContent = `${data.days} 天保管已生效。${data.note || ''}`;
+    } catch (err) {
+      whisperNote.textContent = `保管失败：${String(err?.message || err)}`;
+    } finally {
+      custodyBtn.disabled = false;
+    }
+    return;
+  }
+
   const reportBtn = event.target.closest('[data-report]');
   if (reportBtn) {
     const reason = window.prompt('举报这个居民？可以写一句原因（只保存在本机）。', '');
@@ -1325,7 +1360,7 @@ exportBtn.addEventListener('click', async () => {
     const response = await fetch('/api/chronicle/export', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ viewerId: VIEWER_ID, fromDay: day, toDay: day }),
+      body: JSON.stringify({ viewerId: VIEWER_ID, fromDay: day, toDay: day, lang: LANG }),
     });
     const data = await response.json();
     if (!data.ok) throw new Error(data.error || `HTTP ${response.status}`);

@@ -136,6 +136,25 @@ function mockSay(world, a, other) {
 
 // ---------- 规则大脑（离线可用） ----------
 
+// 规则大脑按“自己的信念”判断威胁：被谁打过、听说谁杀过人。
+// 默认关闭（BELIEF_RULES=1 开启），因为这会明显改变 NPC 的行为。
+function believesThreat(agent, otherId) {
+  return (agent.beliefs || []).some((belief) => {
+    const claim = belief.claim;
+    if (!claim || (belief.confidence ?? 1) < 0.4) return false;
+    if (
+      claim.kind === 'fight' &&
+      claim.predicate === 'hit' &&
+      claim.subjectId === otherId &&
+      claim.targetId === agent.id
+    ) {
+      return true;
+    }
+    if (claim.kind === 'death' && claim.killerId === otherId) return true;
+    return false;
+  });
+}
+
 export function mockDecide(world, a) {
   const traits = traitsOf(a);
   if (a.hunger < 32 && a.inventory.food > 0) return { type: 'eat', remaining: 1 };
@@ -147,7 +166,14 @@ export function mockDecide(world, a) {
     return fleeAction();
   }
 
-  const hostile = nearestAgent(world, a, 1, (o) => (a.relationships[o.id] || 0) < -20);
+  const hostile = nearestAgent(
+    world,
+    a,
+    1,
+    (o) =>
+      (a.relationships[o.id] || 0) < -20 ||
+      (world.config?.beliefDrivenRules && believesThreat(a, o.id))
+  );
   if (hostile) {
     const ready = a.hp > 50 - (traits.aggression || 0) * 15;
     if (ready && a.skills.fight >= 2) return { type: 'attack', target: hostile.id, reason: '上一次的仇还没算', remaining: 2 };

@@ -98,6 +98,17 @@ test('编年史导出返回本机观看者的 Markdown 版本', async (t) => {
     assert.equal(page.status, 200);
     assert.match(await page.text(), /arrivalDialog/);
 
+    // 没有配置模型时，翻译接口原样返回中文。
+    const translated = await fetch(`${base}/api/translate`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ texts: ['你好', '世界'], lang: 'en' }),
+    });
+    const translatedBody = await translated.json();
+    assert.equal(translated.status, 200);
+    assert.deepEqual(translatedBody.translations, ['你好', '世界']);
+    assert.equal(translatedBody.model, false);
+
     // 时间轴回到第 1 天：日志重放出来的历史快照。
     const history = await (await fetch(`${base}/api/history?day=1`)).json();
     assert.equal(history.history, true);

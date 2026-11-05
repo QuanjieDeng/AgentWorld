@@ -200,3 +200,25 @@ test('同样的世界，脱变标签可复现', () => {
   }
   assert.deepEqual(run(), run());
 });
+
+test('死前不足 2 次脱变的人会完成临终脱变', () => {
+  const world = createWorld(7);
+  const a = world.agents[0];
+  a.turningPoints = [];
+  a.maxTurnings = 5;
+  kill(world, a, '死于测试');
+  assert.equal(a.turningPoints.length, 2);
+  assert.equal(a.turningPoints[0].trigger, 'last_days');
+  assert.equal(a.turningPoints[1].trigger, 'deathbed');
+  assert.equal(a.identity, a.turningPoints[1].label);
+
+  // 已经够 2 次的人不会再补。
+  const b = world.agents[1];
+  b.turningPoints = [
+    { trigger: 'killed', label: '幸存者' },
+    { trigger: 'leader', label: '首领' },
+  ];
+  const before = b.turningPoints.length;
+  kill(world, b, '死于测试');
+  assert.equal(b.turningPoints.length, before);
+});
